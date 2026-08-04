@@ -1,0 +1,30 @@
+# Dependencies (rebuilt inside image)
+node_modules/
+.npm-cache/
+
+# Environment / secrets
+.env
+.env.*
+
+# Runtime output
+logs/
+logs-station2/
+*.log
+cache/
+
+# Unused source files
+console.js
+backup.js
+oldrunner.js
+
+# PM2 / deployment config
+ecosystem.config.cjs
+
+# Git
+.git/
+.gitignore
+
+# Docker files (no need to copy these into the image)
+Dockerfile
+docker-compose.yml
+.dockerignore

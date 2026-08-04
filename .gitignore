@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+.npm-cache/
+
+# Runtime output
+logs/
+*.log
+cache/
+
+# Secrets — copy .env.compose.example to .env.compose and fill in your values
+.env
+.env.*
+!.env.compose.example

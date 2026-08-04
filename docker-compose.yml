@@ -1,0 +1,56 @@
+services:
+  station1:
+    build: .
+    image: radio-showrunner:latest
+    restart: unless-stopped
+    environment:
+      SUPABASE_URL: ${STATION1_SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${STATION1_SERVICE_KEY}
+      SUPABASE_STORAGE_BUCKET: ${STATION1_BUCKET:-show-audio}
+      ICE_HOST: ${STATION1_ICE_HOST}
+      ICE_PORT: ${STATION1_ICE_PORT:-8025}
+      ICE_DEFAULT_SOURCE_USER: ${STATION1_ICE_USER}
+      ICE_DEFAULT_SOURCE_PASS: ${STATION1_ICE_PASS}
+      STATION_TZ: ${STATION1_TZ:-Europe/London}
+      ENABLE_LOCAL_COPY: "true"
+      ENABLE_FFPROBE_DURATION_CHECK: "true"
+      HEALTH_PORT: "8080"
+    ports:
+      - "${STATION1_HOST_PORT:-8080}:8080"
+    volumes:
+      - station1_cache:/app/cache
+      - station1_logs:/app/logs
+
+  station2:
+    build: .
+    image: radio-showrunner:latest
+    restart: unless-stopped
+    environment:
+      SUPABASE_URL: ${STATION2_SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${STATION2_SERVICE_KEY}
+      SUPABASE_STORAGE_BUCKET: ${STATION2_BUCKET:-show-audio}
+      ICE_HOST: ${STATION2_ICE_HOST}
+      ICE_PORT: ${STATION2_ICE_PORT:-8025}
+      ICE_DEFAULT_SOURCE_USER: ${STATION2_ICE_USER}
+      ICE_DEFAULT_SOURCE_PASS: ${STATION2_ICE_PASS}
+      STATION_TZ: ${STATION2_TZ:-Europe/London}
+      ENABLE_LOCAL_COPY: "true"
+      ENABLE_FFPROBE_DURATION_CHECK: "true"
+      HEALTH_PORT: "8080"
+    ports:
+      - "${STATION2_HOST_PORT:-8081}:8080"
+    volumes:
+      - station2_cache:/app/cache
+      - station2_logs:/app/logs
+
+  # To add a third station:
+  # 1. Copy the station2 block below and rename to station3
+  # 2. Add STATION3_* variables to .env.compose
+  # 3. Add station3_cache and station3_logs to the volumes section below
+  # 4. Run: docker compose --env-file .env.compose up -d station3
+
+volumes:
+  station1_cache:
+  station1_logs:
+  station2_cache:
+  station2_logs:
