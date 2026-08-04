@@ -4,16 +4,36 @@ services:
     image: radio-showrunner:latest
     restart: unless-stopped
     environment:
+      # Supabase
       SUPABASE_URL: ${STATION1_SUPABASE_URL}
       SUPABASE_SERVICE_ROLE_KEY: ${STATION1_SERVICE_KEY}
       SUPABASE_STORAGE_BUCKET: ${STATION1_BUCKET:-show-audio}
+      # Icecast source
       ICE_HOST: ${STATION1_ICE_HOST}
       ICE_PORT: ${STATION1_ICE_PORT:-8025}
       ICE_DEFAULT_SOURCE_USER: ${STATION1_ICE_USER}
       ICE_DEFAULT_SOURCE_PASS: ${STATION1_ICE_PASS}
+      AUTH_401_FAILOVER_THRESHOLD: ${STATION1_AUTH_401_FAILOVER:-3}
+      # Icecast admin kick
+      ENABLE_ICECAST_ADMIN_KICK: ${STATION1_ADMIN_KICK:-false}
+      ICE_ADMIN_PROTO: ${STATION1_ADMIN_PROTO:-http}
+      ICE_ADMIN_HOST: ${STATION1_ADMIN_HOST}
+      ICE_ADMIN_PORT: ${STATION1_ADMIN_PORT}
+      ICE_ADMIN_USER: ${STATION1_ADMIN_USER}
+      ICE_ADMIN_PASS: ${STATION1_ADMIN_PASS}
+      ADMIN_KICK_BEFORE_START: ${STATION1_KICK_BEFORE_START:-false}
+      ADMIN_KICK_ON_ATTEMPT: ${STATION1_KICK_ON_ATTEMPT:-0}
+      # Now Playing
+      NOWPLAYING_UPDATE_URL: ${STATION1_NOWPLAYING_URL}
+      NOWPLAYING_API_KEY: ${STATION1_NOWPLAYING_KEY}
+      # Scheduling
       STATION_TZ: ${STATION1_TZ:-Europe/London}
+      PREFETCH_MS: ${STATION1_PREFETCH_MS:-0}
+      SAFETY_RESYNC_MS: ${STATION1_RESYNC_MS:-300000}
+      # Streaming
       ENABLE_LOCAL_COPY: "true"
       ENABLE_FFPROBE_DURATION_CHECK: "true"
+      EOF_BEHAVIOR: ${STATION1_EOF_BEHAVIOR:-resume}
       HEALTH_PORT: "8080"
     ports:
       - "${STATION1_HOST_PORT:-8080}:8080"
@@ -26,16 +46,36 @@ services:
     image: radio-showrunner:latest
     restart: unless-stopped
     environment:
+      # Supabase
       SUPABASE_URL: ${STATION2_SUPABASE_URL}
       SUPABASE_SERVICE_ROLE_KEY: ${STATION2_SERVICE_KEY}
       SUPABASE_STORAGE_BUCKET: ${STATION2_BUCKET:-show-audio}
+      # Icecast source
       ICE_HOST: ${STATION2_ICE_HOST}
       ICE_PORT: ${STATION2_ICE_PORT:-8025}
       ICE_DEFAULT_SOURCE_USER: ${STATION2_ICE_USER}
       ICE_DEFAULT_SOURCE_PASS: ${STATION2_ICE_PASS}
+      AUTH_401_FAILOVER_THRESHOLD: ${STATION2_AUTH_401_FAILOVER:-3}
+      # Icecast admin kick
+      ENABLE_ICECAST_ADMIN_KICK: ${STATION2_ADMIN_KICK:-false}
+      ICE_ADMIN_PROTO: ${STATION2_ADMIN_PROTO:-http}
+      ICE_ADMIN_HOST: ${STATION2_ADMIN_HOST}
+      ICE_ADMIN_PORT: ${STATION2_ADMIN_PORT}
+      ICE_ADMIN_USER: ${STATION2_ADMIN_USER}
+      ICE_ADMIN_PASS: ${STATION2_ADMIN_PASS}
+      ADMIN_KICK_BEFORE_START: ${STATION2_KICK_BEFORE_START:-false}
+      ADMIN_KICK_ON_ATTEMPT: ${STATION2_KICK_ON_ATTEMPT:-0}
+      # Now Playing
+      NOWPLAYING_UPDATE_URL: ${STATION2_NOWPLAYING_URL}
+      NOWPLAYING_API_KEY: ${STATION2_NOWPLAYING_KEY}
+      # Scheduling
       STATION_TZ: ${STATION2_TZ:-Europe/London}
+      PREFETCH_MS: ${STATION2_PREFETCH_MS:-0}
+      SAFETY_RESYNC_MS: ${STATION2_RESYNC_MS:-300000}
+      # Streaming
       ENABLE_LOCAL_COPY: "true"
       ENABLE_FFPROBE_DURATION_CHECK: "true"
+      EOF_BEHAVIOR: ${STATION2_EOF_BEHAVIOR:-resume}
       HEALTH_PORT: "8080"
     ports:
       - "${STATION2_HOST_PORT:-8081}:8080"
@@ -44,10 +84,11 @@ services:
       - station2_logs:/app/logs
 
   # To add a third station:
-  # 1. Copy the station2 block below and rename to station3
-  # 2. Add STATION3_* variables to .env.compose
-  # 3. Add station3_cache and station3_logs to the volumes section below
-  # 4. Run: docker compose --env-file .env.compose up -d station3
+  # 1. Copy the station2 block and rename to station3
+  # 2. Replace all STATION2_ prefixes with STATION3_
+  # 3. Add STATION3_* variables to .env.compose
+  # 4. Add station3_cache and station3_logs to the volumes section below
+  # 5. Run: docker compose --env-file .env.compose up -d station3
 
 volumes:
   station1_cache:
