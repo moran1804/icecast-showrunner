@@ -1,97 +1,207 @@
 services:
+
+  # ===========================================================================
+  # STATION 1
+  # ===========================================================================
   station1:
     build: .
     image: radio-showrunner:latest
     restart: unless-stopped
     environment:
-      # Supabase
-      SUPABASE_URL: ${STATION1_SUPABASE_URL}
-      SUPABASE_SERVICE_ROLE_KEY: ${STATION1_SERVICE_KEY}
-      SUPABASE_STORAGE_BUCKET: ${STATION1_BUCKET:-show-audio}
-      # Icecast source
-      ICE_HOST: ${STATION1_ICE_HOST}
-      ICE_PORT: ${STATION1_ICE_PORT:-8025}
-      ICE_DEFAULT_SOURCE_USER: ${STATION1_ICE_USER}
-      ICE_DEFAULT_SOURCE_PASS: ${STATION1_ICE_PASS}
-      AUTH_401_FAILOVER_THRESHOLD: ${STATION1_AUTH_401_FAILOVER:-3}
-      # Icecast admin kick
-      ENABLE_ICECAST_ADMIN_KICK: ${STATION1_ADMIN_KICK:-false}
-      ICE_ADMIN_PROTO: ${STATION1_ADMIN_PROTO:-http}
-      ICE_ADMIN_HOST: ${STATION1_ADMIN_HOST}
-      ICE_ADMIN_PORT: ${STATION1_ADMIN_PORT}
-      ICE_ADMIN_USER: ${STATION1_ADMIN_USER}
-      ICE_ADMIN_PASS: ${STATION1_ADMIN_PASS}
-      ADMIN_KICK_BEFORE_START: ${STATION1_KICK_BEFORE_START:-false}
-      ADMIN_KICK_ON_ATTEMPT: ${STATION1_KICK_ON_ATTEMPT:-0}
-      # Now Playing
-      NOWPLAYING_UPDATE_URL: ${STATION1_NOWPLAYING_URL}
-      NOWPLAYING_API_KEY: ${STATION1_NOWPLAYING_KEY}
-      # Scheduling
-      STATION_TZ: ${STATION1_TZ:-Europe/London}
-      PREFETCH_MS: ${STATION1_PREFETCH_MS:-0}
-      SAFETY_RESYNC_MS: ${STATION1_RESYNC_MS:-300000}
-      # Streaming
-      ENABLE_LOCAL_COPY: "true"
-      ENABLE_FFPROBE_DURATION_CHECK: "true"
-      EOF_BEHAVIOR: ${STATION1_EOF_BEHAVIOR:-resume}
-      HEALTH_PORT: "8080"
+      # --- Supabase ---
+      SUPABASE_URL:                 ${STATION1_SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY:    ${STATION1_SERVICE_KEY}
+      SUPABASE_STORAGE_BUCKET:      ${STATION1_BUCKET:-show-audio}
+
+      # --- Icecast source ---
+      ICE_HOST:                     ${STATION1_ICE_HOST}
+      ICE_PORT:                     ${STATION1_ICE_PORT:-8025}
+      ICE_DEFAULT_SOURCE_USER:      ${STATION1_ICE_USER}
+      ICE_DEFAULT_SOURCE_PASS:      ${STATION1_ICE_PASS}
+      AUTH_401_FAILOVER_THRESHOLD:  ${STATION1_AUTH_401_FAILOVER:-3}
+
+      # --- Icecast admin kick ---
+      ENABLE_ICECAST_ADMIN_KICK:    ${STATION1_ADMIN_KICK:-false}
+      ICE_ADMIN_PROTO:              ${STATION1_ADMIN_PROTO:-http}
+      ICE_ADMIN_HOST:               ${STATION1_ADMIN_HOST:-}
+      ICE_ADMIN_PORT:               ${STATION1_ADMIN_PORT:-}
+      ICE_ADMIN_USER:               ${STATION1_ADMIN_USER:-}
+      ICE_ADMIN_PASS:               ${STATION1_ADMIN_PASS:-}
+      ADMIN_KICK_BEFORE_START:      ${STATION1_KICK_BEFORE_START:-false}
+      ADMIN_KICK_ON_ATTEMPT:        ${STATION1_KICK_ON_ATTEMPT:-0}
+
+      # --- Now Playing ---
+      NOWPLAYING_UPDATE_URL:        ${STATION1_NOWPLAYING_URL:-}
+      NOWPLAYING_API_KEY:           ${STATION1_NOWPLAYING_KEY:-}
+
+      # --- Scheduling ---
+      STATION_TZ:                   ${STATION1_TZ:-UTC}
+      PREFETCH_MS:                  ${STATION1_PREFETCH_MS:-0}
+      SAFETY_RESYNC_MS:             ${STATION1_RESYNC_MS:-300000}
+      PREEMPT_WAIT_MS:              ${STATION1_PREEMPT_WAIT_MS:-5000}
+      PREEMPT_POLL_MS:              ${STATION1_PREEMPT_POLL_MS:-500}
+
+      # --- Connection & retries ---
+      RETRY_TOTAL_MS:               ${STATION1_RETRY_TOTAL_MS:-180000}
+      RETRY_DELAY_MS:               ${STATION1_RETRY_DELAY_MS:-5000}
+      CONNECT_GRACE_MS:             ${STATION1_CONNECT_GRACE_MS:-7000}
+      RECONNECT_DELAY_MS:           ${STATION1_RECONNECT_DELAY_MS:-2000}
+
+      # --- Streaming ---
+      EOF_BEHAVIOR:                 ${STATION1_EOF_BEHAVIOR:-resume}
+      ENABLE_LOCAL_COPY:            ${STATION1_LOCAL_COPY:-true}
+      SIGNED_URL_TTL_SECS:          ${STATION1_SIGNED_URL_TTL:-3600}
+      DOWNLOAD_RETRY_TOTAL_MS:      ${STATION1_DL_RETRY_TOTAL_MS:-600000}
+      DOWNLOAD_RETRY_DELAY_MS:      ${STATION1_DL_RETRY_DELAY_MS:-5000}
+      MAX_LOCAL_FILE_MB:            ${STATION1_MAX_FILE_MB:-2048}
+
+      # --- Monitoring ---
+      ENABLE_FFPROBE_DURATION_CHECK: ${STATION1_FFPROBE:-true}
+      DURATION_WARN_PAD_SECS:       ${STATION1_DURATION_WARN_PAD:-5}
+      LAST_ERROR_LIMIT:             ${STATION1_LAST_ERROR_LIMIT:-5}
+
+      # --- Internal (fixed per container — do not change) ---
+      HEALTH_PORT:    "8080"
+      LOG_DIR:        /app/logs
+      LOCAL_CACHE_DIR: /app/cache
+
     ports:
       - "${STATION1_HOST_PORT:-8080}:8080"
     volumes:
       - station1_cache:/app/cache
       - station1_logs:/app/logs
 
+
+  # ===========================================================================
+  # STATION 2
+  # ===========================================================================
   station2:
     build: .
     image: radio-showrunner:latest
     restart: unless-stopped
     environment:
-      # Supabase
-      SUPABASE_URL: ${STATION2_SUPABASE_URL}
-      SUPABASE_SERVICE_ROLE_KEY: ${STATION2_SERVICE_KEY}
-      SUPABASE_STORAGE_BUCKET: ${STATION2_BUCKET:-show-audio}
-      # Icecast source
-      ICE_HOST: ${STATION2_ICE_HOST}
-      ICE_PORT: ${STATION2_ICE_PORT:-8025}
-      ICE_DEFAULT_SOURCE_USER: ${STATION2_ICE_USER}
-      ICE_DEFAULT_SOURCE_PASS: ${STATION2_ICE_PASS}
-      AUTH_401_FAILOVER_THRESHOLD: ${STATION2_AUTH_401_FAILOVER:-3}
-      # Icecast admin kick
-      ENABLE_ICECAST_ADMIN_KICK: ${STATION2_ADMIN_KICK:-false}
-      ICE_ADMIN_PROTO: ${STATION2_ADMIN_PROTO:-http}
-      ICE_ADMIN_HOST: ${STATION2_ADMIN_HOST}
-      ICE_ADMIN_PORT: ${STATION2_ADMIN_PORT}
-      ICE_ADMIN_USER: ${STATION2_ADMIN_USER}
-      ICE_ADMIN_PASS: ${STATION2_ADMIN_PASS}
-      ADMIN_KICK_BEFORE_START: ${STATION2_KICK_BEFORE_START:-false}
-      ADMIN_KICK_ON_ATTEMPT: ${STATION2_KICK_ON_ATTEMPT:-0}
-      # Now Playing
-      NOWPLAYING_UPDATE_URL: ${STATION2_NOWPLAYING_URL}
-      NOWPLAYING_API_KEY: ${STATION2_NOWPLAYING_KEY}
-      # Scheduling
-      STATION_TZ: ${STATION2_TZ:-Europe/London}
-      PREFETCH_MS: ${STATION2_PREFETCH_MS:-0}
-      SAFETY_RESYNC_MS: ${STATION2_RESYNC_MS:-300000}
-      # Streaming
-      ENABLE_LOCAL_COPY: "true"
-      ENABLE_FFPROBE_DURATION_CHECK: "true"
-      EOF_BEHAVIOR: ${STATION2_EOF_BEHAVIOR:-resume}
-      HEALTH_PORT: "8080"
+      # --- Supabase ---
+      SUPABASE_URL:                 ${STATION2_SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY:    ${STATION2_SERVICE_KEY}
+      SUPABASE_STORAGE_BUCKET:      ${STATION2_BUCKET:-show-audio}
+
+      # --- Icecast source ---
+      ICE_HOST:                     ${STATION2_ICE_HOST}
+      ICE_PORT:                     ${STATION2_ICE_PORT:-8025}
+      ICE_DEFAULT_SOURCE_USER:      ${STATION2_ICE_USER}
+      ICE_DEFAULT_SOURCE_PASS:      ${STATION2_ICE_PASS}
+      AUTH_401_FAILOVER_THRESHOLD:  ${STATION2_AUTH_401_FAILOVER:-3}
+
+      # --- Icecast admin kick ---
+      ENABLE_ICECAST_ADMIN_KICK:    ${STATION2_ADMIN_KICK:-false}
+      ICE_ADMIN_PROTO:              ${STATION2_ADMIN_PROTO:-http}
+      ICE_ADMIN_HOST:               ${STATION2_ADMIN_HOST:-}
+      ICE_ADMIN_PORT:               ${STATION2_ADMIN_PORT:-}
+      ICE_ADMIN_USER:               ${STATION2_ADMIN_USER:-}
+      ICE_ADMIN_PASS:               ${STATION2_ADMIN_PASS:-}
+      ADMIN_KICK_BEFORE_START:      ${STATION2_KICK_BEFORE_START:-false}
+      ADMIN_KICK_ON_ATTEMPT:        ${STATION2_KICK_ON_ATTEMPT:-0}
+
+      # --- Now Playing ---
+      NOWPLAYING_UPDATE_URL:        ${STATION2_NOWPLAYING_URL:-}
+      NOWPLAYING_API_KEY:           ${STATION2_NOWPLAYING_KEY:-}
+
+      # --- Scheduling ---
+      STATION_TZ:                   ${STATION2_TZ:-UTC}
+      PREFETCH_MS:                  ${STATION2_PREFETCH_MS:-0}
+      SAFETY_RESYNC_MS:             ${STATION2_RESYNC_MS:-300000}
+      PREEMPT_WAIT_MS:              ${STATION2_PREEMPT_WAIT_MS:-5000}
+      PREEMPT_POLL_MS:              ${STATION2_PREEMPT_POLL_MS:-500}
+
+      # --- Connection & retries ---
+      RETRY_TOTAL_MS:               ${STATION2_RETRY_TOTAL_MS:-180000}
+      RETRY_DELAY_MS:               ${STATION2_RETRY_DELAY_MS:-5000}
+      CONNECT_GRACE_MS:             ${STATION2_CONNECT_GRACE_MS:-7000}
+      RECONNECT_DELAY_MS:           ${STATION2_RECONNECT_DELAY_MS:-2000}
+
+      # --- Streaming ---
+      EOF_BEHAVIOR:                 ${STATION2_EOF_BEHAVIOR:-resume}
+      ENABLE_LOCAL_COPY:            ${STATION2_LOCAL_COPY:-true}
+      SIGNED_URL_TTL_SECS:          ${STATION2_SIGNED_URL_TTL:-3600}
+      DOWNLOAD_RETRY_TOTAL_MS:      ${STATION2_DL_RETRY_TOTAL_MS:-600000}
+      DOWNLOAD_RETRY_DELAY_MS:      ${STATION2_DL_RETRY_DELAY_MS:-5000}
+      MAX_LOCAL_FILE_MB:            ${STATION2_MAX_FILE_MB:-2048}
+
+      # --- Monitoring ---
+      ENABLE_FFPROBE_DURATION_CHECK: ${STATION2_FFPROBE:-true}
+      DURATION_WARN_PAD_SECS:       ${STATION2_DURATION_WARN_PAD:-5}
+      LAST_ERROR_LIMIT:             ${STATION2_LAST_ERROR_LIMIT:-5}
+
+      # --- Internal (fixed per container — do not change) ---
+      HEALTH_PORT:    "8080"
+      LOG_DIR:        /app/logs
+      LOCAL_CACHE_DIR: /app/cache
+
     ports:
       - "${STATION2_HOST_PORT:-8081}:8080"
     volumes:
       - station2_cache:/app/cache
       - station2_logs:/app/logs
 
-  # To add a third station:
-  # 1. Copy the station2 block and rename to station3
-  # 2. Replace all STATION2_ prefixes with STATION3_
-  # 3. Add STATION3_* variables to .env.compose
-  # 4. Add station3_cache and station3_logs to the volumes section below
-  # 5. Run: docker compose --env-file .env.compose up -d station3
+
+  # ===========================================================================
+  # STATION 3 (commented out — uncomment and add STATION3_* to .env.compose)
+  # ===========================================================================
+  # station3:
+  #   build: .
+  #   image: radio-showrunner:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     SUPABASE_URL:                 ${STATION3_SUPABASE_URL}
+  #     SUPABASE_SERVICE_ROLE_KEY:    ${STATION3_SERVICE_KEY}
+  #     SUPABASE_STORAGE_BUCKET:      ${STATION3_BUCKET:-show-audio}
+  #     ICE_HOST:                     ${STATION3_ICE_HOST}
+  #     ICE_PORT:                     ${STATION3_ICE_PORT:-8025}
+  #     ICE_DEFAULT_SOURCE_USER:      ${STATION3_ICE_USER}
+  #     ICE_DEFAULT_SOURCE_PASS:      ${STATION3_ICE_PASS}
+  #     AUTH_401_FAILOVER_THRESHOLD:  ${STATION3_AUTH_401_FAILOVER:-3}
+  #     ENABLE_ICECAST_ADMIN_KICK:    ${STATION3_ADMIN_KICK:-false}
+  #     ICE_ADMIN_PROTO:              ${STATION3_ADMIN_PROTO:-http}
+  #     ICE_ADMIN_HOST:               ${STATION3_ADMIN_HOST:-}
+  #     ICE_ADMIN_PORT:               ${STATION3_ADMIN_PORT:-}
+  #     ICE_ADMIN_USER:               ${STATION3_ADMIN_USER:-}
+  #     ICE_ADMIN_PASS:               ${STATION3_ADMIN_PASS:-}
+  #     ADMIN_KICK_BEFORE_START:      ${STATION3_KICK_BEFORE_START:-false}
+  #     ADMIN_KICK_ON_ATTEMPT:        ${STATION3_KICK_ON_ATTEMPT:-0}
+  #     NOWPLAYING_UPDATE_URL:        ${STATION3_NOWPLAYING_URL:-}
+  #     NOWPLAYING_API_KEY:           ${STATION3_NOWPLAYING_KEY:-}
+  #     STATION_TZ:                   ${STATION3_TZ:-UTC}
+  #     PREFETCH_MS:                  ${STATION3_PREFETCH_MS:-0}
+  #     SAFETY_RESYNC_MS:             ${STATION3_RESYNC_MS:-300000}
+  #     PREEMPT_WAIT_MS:              ${STATION3_PREEMPT_WAIT_MS:-5000}
+  #     PREEMPT_POLL_MS:              ${STATION3_PREEMPT_POLL_MS:-500}
+  #     RETRY_TOTAL_MS:               ${STATION3_RETRY_TOTAL_MS:-180000}
+  #     RETRY_DELAY_MS:               ${STATION3_RETRY_DELAY_MS:-5000}
+  #     CONNECT_GRACE_MS:             ${STATION3_CONNECT_GRACE_MS:-7000}
+  #     RECONNECT_DELAY_MS:           ${STATION3_RECONNECT_DELAY_MS:-2000}
+  #     EOF_BEHAVIOR:                 ${STATION3_EOF_BEHAVIOR:-resume}
+  #     ENABLE_LOCAL_COPY:            ${STATION3_LOCAL_COPY:-true}
+  #     SIGNED_URL_TTL_SECS:          ${STATION3_SIGNED_URL_TTL:-3600}
+  #     DOWNLOAD_RETRY_TOTAL_MS:      ${STATION3_DL_RETRY_TOTAL_MS:-600000}
+  #     DOWNLOAD_RETRY_DELAY_MS:      ${STATION3_DL_RETRY_DELAY_MS:-5000}
+  #     MAX_LOCAL_FILE_MB:            ${STATION3_MAX_FILE_MB:-2048}
+  #     ENABLE_FFPROBE_DURATION_CHECK: ${STATION3_FFPROBE:-true}
+  #     DURATION_WARN_PAD_SECS:       ${STATION3_DURATION_WARN_PAD:-5}
+  #     LAST_ERROR_LIMIT:             ${STATION3_LAST_ERROR_LIMIT:-5}
+  #     HEALTH_PORT:    "8080"
+  #     LOG_DIR:        /app/logs
+  #     LOCAL_CACHE_DIR: /app/cache
+  #   ports:
+  #     - "${STATION3_HOST_PORT:-8082}:8080"
+  #   volumes:
+  #     - station3_cache:/app/cache
+  #     - station3_logs:/app/logs
+
 
 volumes:
   station1_cache:
   station1_logs:
   station2_cache:
   station2_logs:
+  # station3_cache:
+  # station3_logs:
