@@ -2,7 +2,7 @@
 // TZ-aware scheduling, preemption, robust reconnect+resume, optional local-copy mode,
 // ffprobe duration checks, Icecast admin kick, JSON status, ffmpeg log files & last 5 errors,
 // Now Playing POST update after stream connects, and static docs at /docs.
-// Requirements: Node 20+, ffmpeg, (optional) ffprobe, luxon, @supabase/supabase-js, dotenv
+// Requirements: Node 24+, ffmpeg, (optional) ffprobe, luxon, @supabase/supabase-js, dotenv
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
@@ -1104,7 +1104,7 @@ async function gatherStatus({ eventsLimit = 100, upcomingHours = 24 } = {}) {
     },
     timers: { start_timers: startTimers.size, prefetch_timers: prefetchTimers.size, active_procs: activeProcs.size, last_bootstrap_at: lastBootstrapAt ? new Date(lastBootstrapAt).toISOString() : null },
     realtime: rtStates,
-    icecast: { host: ICE_HOST, port: ICE_PORT, reachable: !!ice.ok, status: ice.ok ? ice.status : { error: ice.error || `HTTP ${ice.status}` } },
+    icecast: { host: ICE_HOST, port: ICE_PORT, admin_host: ICE_ADMIN_HOST, admin_port: ICE_ADMIN_PORT, reachable: !!ice.ok, status: ice.ok ? ice.status : { error: ice.error || `HTTP ${ice.status}` } },
     active_processes: active,
     live: Array.isArray(live) ? live : { error: live.error },
     upcoming: Array.isArray(upcoming) ? upcoming : { error: upcoming.error },
@@ -1177,11 +1177,22 @@ function startHealthServer() {
 // ===== Icecast status + live/upcoming/events helpers for status =====
 async function fetchIcecastStatus() {
   try {
-    const res = await fetch(`http://${ICE_HOST}:${ICE_PORT}/status-json.xsl`);
+    const url = `${ICE_ADMIN_PROTO}://${ICE_ADMIN_HOST}:${ICE_ADMIN_PORT}/status-json.xsl`;
+    const headers = {};
+
+    if (ICE_ADMIN_USER || ICE_ADMIN_PASS) {
+      const credentials = Buffer.from(`${ICE_ADMIN_USER}:${ICE_ADMIN_PASS}`).toString('base64');
+      headers.Authorization = `Basic ${credentials}`;
+    }
+
+    const res = await fetch(url, { headers });
     if (!res.ok) return { ok: false, status: res.status };
+
     const json = await res.json();
     return { ok: true, status: json.icestats || json };
-  } catch (e) { return { ok: false, error: e.message }; }
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 function mapSafeDj(dj) { return dj ? { id: dj.id, display_name: dj.display_name, icecast_mountpoint: dj.icecast_mountpoint || '/live' } : null; }
 function mapSafeShow(show) { return show ? { id: show.id, title: show.title } : null; }
