@@ -189,8 +189,8 @@ replaceOnce(
     '-metadata', \`streamurl=https://\${ICE_HOST}\`,
     '-vn', '-content_type', 'audio/mpeg',
     '-ice_name', title,`,
-`    '-metadata', \`title=\${djName || showName}\`,
-    '-metadata', \`artist=\${showName}\`,
+`    '-metadata', \`title=\${showName}\`,
+    ...(djName ? ['-metadata', \`artist=\${djName}\`] : []),
     ...(album ? ['-metadata', \`album=\${album}\`] : []),
     '-metadata', \`streamtitle=\${icyTitle}\`,
     '-metadata', \`streamurl=https://\${ICE_HOST}\`,
@@ -226,8 +226,8 @@ replaceOnce(
       await syncStreamerArtwork({ jobId, streamerId, profilePictureUrl });
       await postNowPlayingUpdate({
         jobId,
-        artist: streamTitle || '',
-        title: artistName || streamTitle || '',
+        artist: artistName || '',
+        title: streamTitle || artistName || '',
         album: showDescription || ''
       });
       playShowWithReconnect._postedNowPlaying = playShowWithReconnect._postedNowPlaying || {};
