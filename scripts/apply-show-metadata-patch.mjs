@@ -24,7 +24,7 @@ replaceOnce(
           )
         )`,
 `        show:shows (
-          id, title, description, storage_path,
+          id, title, storage_path,
           dj:djs (
             id,
             display_name,
@@ -63,15 +63,12 @@ replaceOnce(
     await logEvent(jobId, \`nowplaying error: \${e.message}\`, 'error');
   }
 }`,
-`async function postNowPlayingUpdate({ jobId, artist, title, album }) {
+`async function postNowPlayingUpdate({ jobId, artist, title }) {
   if (!NOWPLAYING_UPDATE_URL || !NOWPLAYING_API_KEY) {
     await logEvent(jobId, \`nowplaying: skipped (missing NOWPLAYING_UPDATE_URL or NOWPLAYING_API_KEY)\`);
     return;
   }
   try {
-    const payload = { artist, title };
-    if (album) payload.album = album;
-
     const res = await fetch(NOWPLAYING_UPDATE_URL, {
       method: 'POST',
       headers: {
@@ -79,13 +76,13 @@ replaceOnce(
         'Content-Type': 'application/json',
         'X-API-Key': NOWPLAYING_API_KEY
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({ artist, title })
     });
     if (!res.ok) {
       await logEvent(jobId, \`nowplaying: HTTP \${res.status} while updating "\${title}" — \${artist}\`, 'error');
       return;
     }
-    await logEvent(jobId, \`nowplaying: updated → artist="\${artist}" | title="\${title}" | album="\${album || ''}" (key=\${maskKey(NOWPLAYING_API_KEY)})\`);
+    await logEvent(jobId, \`nowplaying: updated → artist="\${artist}" | title="\${title}" (key=\${maskKey(NOWPLAYING_API_KEY)})\`);
   } catch (e) {
     await logEvent(jobId, \`nowplaying error: \${e.message}\`, 'error');
   }
@@ -163,7 +160,7 @@ async function syncStreamerArtwork({ jobId, streamerId, profilePictureUrl }) {
 );
 
 replaceOnce(
-  'ffmpeg metadata signature',
+  'ffmpeg metadata normalization',
 `  streamTitle, artistName,
   seekSeconds = 0
 }) {
@@ -171,13 +168,12 @@ replaceOnce(
   const title  = streamTitle || 'Scheduled Show';
   const artist = artistName || '';
   const icyTitle = artist ? \`\${title} - \${artist}\` : title;`,
-`  streamTitle, artistName, showDescription,
+`  streamTitle, artistName,
   seekSeconds = 0
 }) {
   const outUrl = \`icecast://\${encodeURIComponent(iceUser)}:\${encodeURIComponent(icePass)}@\${ICE_HOST}:\${ICE_PORT}\${mount}\`;
   const showName = String(streamTitle || 'Scheduled Show').replace(/\\s+/g, ' ').trim();
   const djName = String(artistName || '').replace(/\\s+/g, ' ').trim();
-  const album = String(showDescription || '').replace(/\\s+/g, ' ').trim();
   const icyTitle = djName ? \`\${showName} - \${djName}\` : showName;`
 );
 
@@ -191,7 +187,6 @@ replaceOnce(
     '-ice_name', title,`,
 `    '-metadata', \`title=\${showName}\`,
     ...(djName ? ['-metadata', \`artist=\${djName}\`] : []),
-    ...(album ? ['-metadata', \`album=\${album}\`] : []),
     '-metadata', \`streamtitle=\${icyTitle}\`,
     '-metadata', \`streamurl=https://\${ICE_HOST}\`,
     '-vn', '-content_type', 'audio/mpeg',
@@ -202,17 +197,9 @@ replaceOnce(
   'play reconnect signature',
 `  mount, streamTitle, artistName,
   endsAtUtc, originalSlotSeconds`,
-`  mount, streamTitle, artistName, showDescription,
+`  mount, streamTitle, artistName,
   streamerId, profilePictureUrl,
   endsAtUtc, originalSlotSeconds`
-);
-
-replaceOnce(
-  'ffmpeg metadata call',
-`      mount, streamTitle, artistName,
-      seekSeconds`,
-`      mount, streamTitle, artistName, showDescription,
-      seekSeconds`
 );
 
 replaceOnce(
@@ -227,8 +214,7 @@ replaceOnce(
       await postNowPlayingUpdate({
         jobId,
         artist: artistName || '',
-        title: streamTitle || artistName || '',
-        album: showDescription || ''
+        title: streamTitle || artistName || ''
       });
       playShowWithReconnect._postedNowPlaying = playShowWithReconnect._postedNowPlaying || {};
       playShowWithReconnect._postedNowPlaying[jobId] = true;
@@ -260,23 +246,14 @@ replaceOnce(
 );
 
 replaceOnce(
-  'show description variable',
-`  const streamTitle = show.title || \`\${dj.display_name} Show\`;
-  const artistName  = dj.display_name || '';`,
-`  const streamTitle = show.title || \`\${dj.display_name} Show\`;
-  const artistName  = dj.display_name || '';
-  const showDescription = show.description || '';`
-);
-
-replaceOnce(
   'play reconnect call',
 `    mount, streamTitle, artistName,
     endsAtUtc: endUtc, originalSlotSeconds`,
-`    mount, streamTitle, artistName, showDescription,
+`    mount, streamTitle, artistName,
     streamerId: dj.azuracast_streamer_id,
     profilePictureUrl: dj.profile_picture_url,
     endsAtUtc: endUtc, originalSlotSeconds`
 );
 
 writeFileSync(runnerPath, source);
-console.log('Applied ShowRunner show metadata and DJ artwork patch.');
+console.log('Applied ShowRunner title/DJ metadata and DJ artwork patch.');
