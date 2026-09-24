@@ -178,6 +178,8 @@ async function getJobById(jobId) {
           dj:djs (
             id,
             display_name,
+            profile_picture_url,
+            azuracast_streamer_id,
             icecast_username,
             icecast_password_encrypted,
             icecast_mountpoint
@@ -430,9 +432,79 @@ async function postNowPlayingUpdate({ jobId, artist, title }) {
       await logEvent(jobId, `nowplaying: HTTP ${res.status} while updating "${title}" — ${artist}`, 'error');
       return;
     }
-    await logEvent(jobId, `nowplaying: updated → title="${title}" | artist="${artist}" (key=${maskKey(NOWPLAYING_API_KEY)})`);
+    await logEvent(jobId, `nowplaying: updated → artist="${artist}" | title="${title}" (key=${maskKey(NOWPLAYING_API_KEY)})`);
   } catch (e) {
     await logEvent(jobId, `nowplaying error: ${e.message}`, 'error');
+  }
+}
+
+const syncedStreamerArtwork = new Set();
+
+function getStreamerArtworkUpdateUrl(streamerId) {
+  if (!NOWPLAYING_UPDATE_URL || !streamerId) return null;
+  try {
+    const url = new URL(NOWPLAYING_UPDATE_URL);
+    const nextPath = url.pathname.replace(
+      /\/nowplaying\/update\/?$/,
+      `/streamer/${streamerId}/art`
+    );
+    if (nextPath === url.pathname) return null;
+    url.pathname = nextPath;
+    url.search = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function syncStreamerArtwork({ jobId, streamerId, profilePictureUrl }) {
+  if (!streamerId || !profilePictureUrl || !NOWPLAYING_API_KEY) return;
+
+  const cacheKey = `${streamerId}:${profilePictureUrl}`;
+  if (syncedStreamerArtwork.has(cacheKey)) return;
+
+  const artworkUrl = getStreamerArtworkUpdateUrl(streamerId);
+  if (!artworkUrl) {
+    await logEvent(jobId, 'streamer artwork: skipped (could not derive AzuraCast artwork URL)', 'error');
+    return;
+  }
+
+  try {
+    const imageRes = await fetch(profilePictureUrl);
+    if (!imageRes.ok) throw new Error(`profile image HTTP ${imageRes.status}`);
+
+    const contentType = (imageRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!['image/jpeg', 'image/png'].includes(contentType)) {
+      throw new Error(`unsupported image type ${contentType || 'unknown'}`);
+    }
+
+    const bytes = await imageRes.arrayBuffer();
+    const ext = contentType === 'image/png' ? 'png' : 'jpg';
+    const form = new FormData();
+    form.append(
+      'file_data',
+      new Blob([bytes], { type: contentType }),
+      `streamer-${streamerId}.${ext}`
+    );
+
+    const res = await fetch(artworkUrl, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'X-API-Key': NOWPLAYING_API_KEY
+      },
+      body: form
+    });
+
+    if (!res.ok) {
+      const body = (await res.text()).slice(0, 240);
+      throw new Error(`AzuraCast artwork HTTP ${res.status}: ${body}`);
+    }
+
+    syncedStreamerArtwork.add(cacheKey);
+    await logEvent(jobId, `streamer artwork: synced DJ profile image to AzuraCast streamer ${streamerId}`);
+  } catch (e) {
+    await logEvent(jobId, `streamer artwork sync failed: ${e.message}`, 'error');
   }
 }
 
@@ -445,9 +517,9 @@ function buildFfmpegArgs({
   seekSeconds = 0
 }) {
   const outUrl = `icecast://${encodeURIComponent(iceUser)}:${encodeURIComponent(icePass)}@${ICE_HOST}:${ICE_PORT}${mount}`;
-  const title  = streamTitle || 'Scheduled Show';
-  const artist = artistName || '';
-  const icyTitle = artist ? `${title} - ${artist}` : title;
+  const showName = String(streamTitle || 'Scheduled Show').replace(/\s+/g, ' ').trim();
+  const djName = String(artistName || '').replace(/\s+/g, ' ').trim();
+  const icyTitle = djName ? `${showName} - ${djName}` : showName;
 
   const inputOpts = [];
   if (seekSeconds > 0) inputOpts.push('-ss', String(Math.max(0, Math.floor(seekSeconds))));
@@ -475,12 +547,12 @@ function buildFfmpegArgs({
     '-i', fileUrl,
     ...audioFilters,
     '-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-    '-metadata', `title=${title}`,
-    ...(artist ? ['-metadata', `artist=${artist}`] : []),
+    '-metadata', `title=${showName}`,
+    ...(djName ? ['-metadata', `artist=${djName}`] : []),
     '-metadata', `streamtitle=${icyTitle}`,
     '-metadata', `streamurl=https://${ICE_HOST}`,
     '-vn', '-content_type', 'audio/mpeg',
-    '-ice_name', title,
+    '-ice_name', showName,
     '-ice_genre', 'House',
     '-ice_public', '1',
     '-f', 'mp3',
@@ -734,6 +806,7 @@ async function playShowWithReconnect({
   iceUser, icePass,                 // active creds
   fallbackUser, fallbackPass,       // default creds (for failover after 401 threshold)
   mount, streamTitle, artistName,
+  streamerId, profilePictureUrl,
   endsAtUtc, originalSlotSeconds
 }) {
   // Absolute seconds played since start of source across all attempts
@@ -828,7 +901,12 @@ async function playShowWithReconnect({
 
     // Post "now playing" once after we successfully connect the first time
     if (!playShowWithReconnect._postedNowPlaying?.[jobId]) {
-      await postNowPlayingUpdate({ jobId, artist: artistName || '', title: streamTitle || '' });
+      await syncStreamerArtwork({ jobId, streamerId, profilePictureUrl });
+      await postNowPlayingUpdate({
+        jobId,
+        artist: artistName || '',
+        title: streamTitle || artistName || ''
+      });
       playShowWithReconnect._postedNowPlaying = playShowWithReconnect._postedNowPlaying || {};
       playShowWithReconnect._postedNowPlaying[jobId] = true;
     }
@@ -838,6 +916,7 @@ async function playShowWithReconnect({
 
     activeProcs.set(jobId, proc);
     await setJobStatus(jobId, 'running', proc.pid);
+    await setScheduleStatus(schedId, 'live');
     await logEvent(jobId, `ffmpeg pid=${proc.pid} (attempt ${attempt}, seek=${seekSeconds}s)`);
 
     const killMs = Math.max(0, endsAtUtc.toMillis() - DateTime.utc().toMillis());
@@ -1011,9 +1090,8 @@ async function runJobById(jobId) {
     await logEvent(jobId, `Source OK (status ${headRes.status}, type ${headRes.contentType || 'unknown'})`);
   }
 
-  // Mark running/live
-  await setJobStatus(jobId, 'running');
-  await setScheduleStatus(sched.id, 'live');
+  // claimJob keeps the job in "starting". It becomes running/live only after
+  // ffmpeg survives the connection grace period and has a real PID.
 
   // If local copy mode and not already prefetched, try to download now (non-fatal)
   if (ENABLE_LOCAL_COPY && !localFileCache.get(jobId)?.completed) {
@@ -1063,6 +1141,8 @@ async function runJobById(jobId) {
     iceUser, icePass,
     fallbackUser: DEFAULT_SOURCE_USER, fallbackPass: DEFAULT_SOURCE_PASS,
     mount, streamTitle, artistName,
+    streamerId: dj.azuracast_streamer_id,
+    profilePictureUrl: dj.profile_picture_url,
     endsAtUtc: playbackEndUtc, originalSlotSeconds: playbackSlotSeconds
   });
 
@@ -1402,5 +1482,6 @@ async function main() {
   setInterval(() => { bootstrapUpcoming().catch(()=>{}); }, SAFETY_RESYNC_MS);
 }
 main();
+
 
 
