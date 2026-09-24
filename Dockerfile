@@ -8,8 +8,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY runner.js ./
-COPY scripts/apply-show-metadata-patch.mjs ./scripts/apply-show-metadata-patch.mjs
-RUN node ./scripts/apply-show-metadata-patch.mjs && node --check ./runner.js && rm -rf ./scripts
+RUN node --check ./runner.js
 COPY docs/ ./docs/
 
 RUN mkdir -p /app/logs /app/cache
