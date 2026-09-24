@@ -59,6 +59,7 @@ const LOCAL_CACHE_DIR = process.env.LOCAL_CACHE_DIR || '/tmp/radio-cache';
 const DOWNLOAD_RETRY_TOTAL_MS = Number(process.env.DOWNLOAD_RETRY_TOTAL_MS || 600_000);
 const DOWNLOAD_RETRY_DELAY_MS = Number(process.env.DOWNLOAD_RETRY_DELAY_MS || 5_000);
 const MAX_LOCAL_FILE_MB = Number(process.env.MAX_LOCAL_FILE_MB || 2048);
+const MIN_LOCAL_FILE_BYTES = Number(process.env.MIN_LOCAL_FILE_BYTES || 65_536);
 
 // ffprobe duration check
 const ENABLE_FFPROBE_DURATION_CHECK = String(process.env.ENABLE_FFPROBE_DURATION_CHECK || 'true').toLowerCase() === 'true';
@@ -108,6 +109,7 @@ if (!SUPABASE_URL || !SERVICE_KEY) {
 const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { db: { schema: 'public' } });
 
 // ===== Preflight =====
+let ffprobeAvailable = false;
 (function preflightFFmpeg() {
   const res = spawnSync(FFMPEG, ['-version'], { stdio: 'ignore' });
   if (res.status !== 0) {
@@ -119,6 +121,8 @@ const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { db: { schema: 'public
   const res = spawnSync(FFPROBE, ['-version'], { stdio: 'ignore' });
   if (res.status !== 0) {
     console.warn(`⚠️ Could not run "${FFPROBE}". Duration checks will be skipped unless available.`);
+  } else {
+    ffprobeAvailable = true;
   }
 })();
 
@@ -251,6 +255,7 @@ async function head(url) {
 
 // ===== Local download helpers =====
 const localFileCache = new Map(); // jobId -> { path, bytes, completed: bool }
+const localDownloadPromises = new Map(); // jobId -> in-flight download promise
 async function ensureCacheDir() {
   try { await fsp.mkdir(LOCAL_CACHE_DIR, { recursive: true }); }
   catch (e) { console.error('Failed to create LOCAL_CACHE_DIR:', e?.message || e); }
@@ -274,42 +279,85 @@ function safeBasenameFromStoragePath(storagePath, fallback = 'show.mp3') {
   } catch { return fallback; }
 }
 async function downloadShowToLocal({ jobId, storagePath }) {
-  const deadline = Date.now() + DOWNLOAD_RETRY_TOTAL_MS;
-  const fileName = `${jobId}-${safeBasenameFromStoragePath(storagePath)}`;
-  const localPath = path.join(LOCAL_CACHE_DIR, fileName);
-
-  while (Date.now() < deadline) {
+  const cached = localFileCache.get(jobId);
+  if (cached?.completed && cached.path) {
     try {
-      const url = await createSignedDownloadUrl(storagePath);
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-      const contentLen = Number(res.headers.get('content-length') || 0);
-      if (MAX_LOCAL_FILE_MB > 0 && contentLen > 0 && contentLen > MAX_LOCAL_FILE_MB * 1024 * 1024) {
-        throw new Error(`file too large (${contentLen} bytes > cap ${MAX_LOCAL_FILE_MB}MB)`);
+      const stat = await fsp.stat(cached.path);
+      if (stat.isFile() && stat.size === cached.bytes && stat.size >= MIN_LOCAL_FILE_BYTES) {
+        return cached.path;
       }
+    } catch {}
+    localFileCache.delete(jobId);
+  }
 
-      let bytes = 0;
-      const counter = new Transform({ transform(chunk, _enc, cb) { bytes += chunk.length; cb(null, chunk); } });
-      await fsp.mkdir(LOCAL_CACHE_DIR, { recursive: true });
-      const out = createWriteStream(localPath);
+  const inFlight = localDownloadPromises.get(jobId);
+  if (inFlight) return inFlight;
 
-      await pipeline(Readable.fromWeb(res.body), counter, out);
+  const downloadPromise = (async () => {
+    const deadline = Date.now() + DOWNLOAD_RETRY_TOTAL_MS;
+    const fileName = `${jobId}-${safeBasenameFromStoragePath(storagePath)}`;
+    const localPath = path.join(LOCAL_CACHE_DIR, fileName);
 
-      if (contentLen > 0 && bytes !== contentLen) {
-        try { await fsp.unlink(localPath); } catch {}
-        throw new Error(`incomplete download (${bytes}/${contentLen} bytes)`);
+    while (Date.now() < deadline) {
+      const tempPath = `${localPath}.part-${process.pid}-${Date.now()}`;
+      try {
+        const url = await createSignedDownloadUrl(storagePath);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.body) throw new Error('download response had no body');
+
+        const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('application/json') || contentType.includes('text/html') || contentType.includes('text/plain')) {
+          throw new Error(`unexpected content-type ${contentType || 'unknown'}`);
+        }
+
+        const contentLen = Number(res.headers.get('content-length') || 0);
+        if (MAX_LOCAL_FILE_MB > 0 && contentLen > 0 && contentLen > MAX_LOCAL_FILE_MB * 1024 * 1024) {
+          throw new Error(`file too large (${contentLen} bytes > cap ${MAX_LOCAL_FILE_MB}MB)`);
+        }
+
+        let bytes = 0;
+        const counter = new Transform({ transform(chunk, _enc, cb) { bytes += chunk.length; cb(null, chunk); } });
+        await fsp.mkdir(LOCAL_CACHE_DIR, { recursive: true });
+        const out = createWriteStream(tempPath, { flags: 'wx' });
+
+        await pipeline(Readable.fromWeb(res.body), counter, out);
+
+        if (contentLen > 0 && bytes !== contentLen) {
+          throw new Error(`incomplete download (${bytes}/${contentLen} bytes)`);
+        }
+        if (bytes < MIN_LOCAL_FILE_BYTES) {
+          throw new Error(`download too small to be a show audio file (${bytes} bytes; minimum ${MIN_LOCAL_FILE_BYTES})`);
+        }
+
+        if (ENABLE_FFPROBE_DURATION_CHECK && ffprobeAvailable) {
+          const duration = probeDurationSecondsSync(tempPath);
+          if (duration == null || duration <= 0) {
+            throw new Error('downloaded file failed ffprobe validation');
+          }
+        }
+
+        await fsp.rename(tempPath, localPath);
+        localFileCache.set(jobId, { path: localPath, bytes, completed: true });
+        await logEvent(jobId, `Downloaded and validated local audio: ${localPath} (${bytes} bytes)`);
+        return localPath;
+      } catch (e) {
+        try { await fsp.unlink(tempPath); } catch {}
+        await logEvent(jobId, `Download error: ${e.message} — retrying`, 'error');
+        await new Promise(r => setTimeout(r, DOWNLOAD_RETRY_DELAY_MS));
       }
+    }
+    throw new Error(`Download timed out after ${Math.floor(DOWNLOAD_RETRY_TOTAL_MS/1000)}s`);
+  })();
 
-      localFileCache.set(jobId, { path: localPath, bytes, completed: true });
-      await logEvent(jobId, `Downloaded to local: ${localPath} (${bytes} bytes)`);
-      return localPath;
-    } catch (e) {
-      await logEvent(jobId, `Download error: ${e.message} — retrying`, 'error');
-      await new Promise(r => setTimeout(r, DOWNLOAD_RETRY_DELAY_MS));
+  localDownloadPromises.set(jobId, downloadPromise);
+  try {
+    return await downloadPromise;
+  } finally {
+    if (localDownloadPromises.get(jobId) === downloadPromise) {
+      localDownloadPromises.delete(jobId);
     }
   }
-  throw new Error(`Download timed out after ${Math.floor(DOWNLOAD_RETRY_TOTAL_MS/1000)}s`);
 }
 
 // ===== ffprobe (duration) =====
@@ -483,6 +531,7 @@ function clearTimers(jobId) {
 }
 function schedulePrefetch(jobId, runAtIso, storagePath) {
   if (!PREFETCH_MS || !storagePath) return;
+  if (ENABLE_LOCAL_COPY && localFileCache.get(jobId)?.completed) return;
   const delay = Math.max(0, delayFromNowMs(runAtIso) - PREFETCH_MS);
   const pt = setTimeout(async () => {
     prefetchTimers.delete(jobId);
@@ -1100,6 +1149,7 @@ async function gatherStatus({ eventsLimit = 100, upcomingHours = 24 } = {}) {
       SAFETY_RESYNC_MS, PREFETCH_MS, PREEMPT_WAIT_MS, PREEMPT_POLL_MS,
       RETRY_TOTAL_MS, RETRY_DELAY_MS, CONNECT_GRACE_MS, RECONNECT_DELAY_MS,
       EOF_BEHAVIOR, ENABLE_LOCAL_COPY, LOCAL_CACHE_DIR, SIGNED_URL_TTL_SECS,
+      DOWNLOAD_RETRY_TOTAL_MS, DOWNLOAD_RETRY_DELAY_MS, MAX_LOCAL_FILE_MB, MIN_LOCAL_FILE_BYTES,
       AUTH_401_FAILOVER_THRESHOLD
     },
     timers: { start_timers: startTimers.size, prefetch_timers: prefetchTimers.size, active_procs: activeProcs.size, last_bootstrap_at: lastBootstrapAt ? new Date(lastBootstrapAt).toISOString() : null },
@@ -1309,3 +1359,4 @@ async function main() {
   setInterval(() => { bootstrapUpcoming().catch(()=>{}); }, SAFETY_RESYNC_MS);
 }
 main();
+
