@@ -234,6 +234,9 @@ These can be added under `environment:` in `docker-compose.yml` to fine-tune beh
 | `DOWNLOAD_RETRY_TOTAL_MS` | `600000` | Max time to download a file |
 | `MAX_LOCAL_FILE_MB` | `2048` | Safety cap |
 | `MIN_LOCAL_FILE_BYTES` | `65536` | Reject tiny or invalid cache downloads |
+| `HANDOVER_GAP_MS` | `2000` | Stop the outgoing show before the next scheduled start |
+| `FADE_OUT_MS` | `2000` | Fade the outgoing audio during its final two seconds |
+| `FORCE_KILL_AFTER_MS` | `1000` | Escalate to SIGKILL if FFmpeg ignores SIGTERM |
 
 #### Icecast admin kick
 
