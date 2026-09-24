@@ -61,6 +61,11 @@ const DOWNLOAD_RETRY_DELAY_MS = Number(process.env.DOWNLOAD_RETRY_DELAY_MS || 5_
 const MAX_LOCAL_FILE_MB = Number(process.env.MAX_LOCAL_FILE_MB || 2048);
 const MIN_LOCAL_FILE_BYTES = Number(process.env.MIN_LOCAL_FILE_BYTES || 65_536);
 
+// Controlled handover between scheduled shows
+const HANDOVER_GAP_MS = Number(process.env.HANDOVER_GAP_MS || 2_000);
+const FADE_OUT_MS = Number(process.env.FADE_OUT_MS || 2_000);
+const FORCE_KILL_AFTER_MS = Number(process.env.FORCE_KILL_AFTER_MS || 1_000);
+
 // ffprobe duration check
 const ENABLE_FFPROBE_DURATION_CHECK = String(process.env.ENABLE_FFPROBE_DURATION_CHECK || 'true').toLowerCase() === 'true';
 const DURATION_WARN_PAD_SECS = Number(process.env.DURATION_WARN_PAD_SECS || 5);
@@ -455,6 +460,12 @@ function buildFfmpegArgs({
     );
   }
 
+  const fadeSeconds = Math.max(0, Math.min(Number(slotSeconds), FADE_OUT_MS / 1000));
+  const fadeStartSeconds = Math.max(0, Number(slotSeconds) - fadeSeconds);
+  const audioFilters = fadeSeconds > 0
+    ? ['-af', `afade=t=out:st=${fadeStartSeconds.toFixed(3)}:d=${fadeSeconds.toFixed(3)}`]
+    : [];
+
   return [
     '-hide_banner', '-nostats', '-loglevel', 'info',
     '-re',
@@ -462,6 +473,7 @@ function buildFfmpegArgs({
     '-t', String(Math.max(1, Math.floor(slotSeconds))),
     ...inputOpts,
     '-i', fileUrl,
+    ...audioFilters,
     '-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100', '-ac', '2',
     '-metadata', `title=${title}`,
     ...(artist ? ['-metadata', `artist=${artist}`] : []),
@@ -523,6 +535,21 @@ function attachFfmpegLogging(proc, { jobId, attemptTag }) {
   return logPath;
 }
 
+function terminateFfmpeg(proc, { jobId = null, reason = 'stop requested' } = {}) {
+  if (!proc || proc.exitCode !== null) return;
+  try { proc.kill('SIGTERM'); } catch { return; }
+
+  const hardKill = setTimeout(() => {
+    if (proc.exitCode !== null) return;
+    const message = `ffmpeg did not exit after SIGTERM (${reason}); sending SIGKILL`;
+    if (jobId) logEvent(jobId, message, 'error').catch(() => {});
+    else console.error(message);
+    try { proc.kill('SIGKILL'); } catch {}
+  }, Math.max(0, FORCE_KILL_AFTER_MS));
+  hardKill.unref?.();
+  proc.once('exit', () => clearTimeout(hardKill));
+}
+
 function clearTimers(jobId) {
   const t = startTimers.get(jobId);
   if (t) { clearTimeout(t); startTimers.delete(jobId); }
@@ -554,11 +581,11 @@ function schedulePrefetch(jobId, runAtIso, storagePath) {
 function scheduleJob(job, storagePathForPrefetch) {
   clearTimers(job.id);
   const intendedDelay = delayFromNowMs(job.run_at);
-  const delay = Math.max(0, intendedDelay + 1000); // +1s handover buffer
+  const delay = Math.max(0, intendedDelay);
 
   const runAtUtc = parseDbTime(job.run_at);
   if (runAtUtc) {
-    console.log(`📅 Scheduling job ${job.id}: ${fmtLocal(runAtUtc.plus({ seconds: 1 }))}  =  ${fmtUtc(runAtUtc.plus({ seconds: 1 }))} (+1s)`);
+    console.log(`📅 Scheduling job ${job.id}: ${fmtLocal(runAtUtc)}  =  ${fmtUtc(runAtUtc)}`);
   }
 
   if (PREFETCH_MS) schedulePrefetch(job.id, job.run_at, storagePathForPrefetch);
@@ -578,7 +605,7 @@ async function preemptExisting(jobId, mount) {
       await setJobStatus(j.id, 'cancelled');
       if (j.schedule_id) { try { await setScheduleStatus(j.schedule_id, 'cancelled'); } catch {} }
       const local = activeProcs.get(j.id);
-      if (local) { try { local.kill('SIGTERM'); } catch {} }
+      if (local) terminateFfmpeg(local, { jobId: j.id, reason: 'preempted by next show' });
     } catch (e) { console.error(`Preempt cancel failed for job ${j.id}:`, e?.message || e); }
   }));
 
@@ -610,8 +637,8 @@ function killActiveProc(jobId, schedId, showTitle, djName) {
   const proc = activeProcs.get(jobId);
   if (!proc) return;
   console.log(`🛑 CANCEL REQUESTED — "${showTitle}" by ${djName} (job ${jobId})`);
-  logEvent(jobId, `Cancellation requested — sending SIGTERM to ffmpeg`, 'info').catch(() => {});
-  try { proc.kill('SIGTERM'); } catch {}
+  logEvent(jobId, `Cancellation requested — stopping ffmpeg`, 'info').catch(() => {});
+  terminateFfmpeg(proc, { jobId, reason: 'job cancelled' });
 }
 
 function startCancelWatcher(jobId, proc, schedId, showTitle, djName) {
@@ -814,7 +841,10 @@ async function playShowWithReconnect({
     await logEvent(jobId, `ffmpeg pid=${proc.pid} (attempt ${attempt}, seek=${seekSeconds}s)`);
 
     const killMs = Math.max(0, endsAtUtc.toMillis() - DateTime.utc().toMillis());
-    const watchdog = setTimeout(() => { try { proc.kill('SIGTERM'); } catch {} }, killMs);
+    const watchdog = setTimeout(
+      () => terminateFfmpeg(proc, { jobId, reason: 'scheduled handover cutoff' }),
+      killMs
+    );
 
     startCancelWatcher(jobId, proc, schedId, streamTitle, artistName || 'DJ');
 
@@ -906,11 +936,23 @@ async function runJobById(jobId) {
   const originalSlotSeconds = secondsBetween(sched.starts_at, sched.ends_at);
   const startUtc = parseDbTime(sched.starts_at);
   const endUtc   = parseDbTime(sched.ends_at);
-  if (startUtc && endUtc) {
-    const line = `⏰ Slot window: ${fmtLocal(startUtc)}  →  ${fmtLocal(endUtc)}  ( ${fmtUtc(startUtc)} → ${fmtUtc(endUtc)} )  | ${originalSlotSeconds}s`;
-    console.log(line);
-    await logEvent(jobId, line);
+  if (!startUtc || !endUtc || endUtc.toMillis() <= startUtc.toMillis()) {
+    await logEvent(jobId, 'Invalid schedule window — starts_at/ends_at are missing or reversed', 'error');
+    await setJobStatus(jobId, 'failed');
+    try { await setScheduleStatus(sched.id, 'failed'); } catch {}
+    return;
   }
+
+  const maxGapMs = Math.max(0, endUtc.toMillis() - startUtc.toMillis() - 1_000);
+  const appliedGapMs = Math.min(Math.max(0, HANDOVER_GAP_MS), maxGapMs);
+  const playbackEndUtc = endUtc.minus({ milliseconds: appliedGapMs });
+  const playbackSlotSeconds = Math.max(1, Math.floor(
+    (playbackEndUtc.toMillis() - startUtc.toMillis()) / 1000
+  ));
+
+  const line = `⏰ Slot window: ${fmtLocal(startUtc)} → ${fmtLocal(endUtc)} | playback stops at ${fmtLocal(playbackEndUtc)} | fade=${FADE_OUT_MS}ms gap=${appliedGapMs}ms`;
+  console.log(line);
+  await logEvent(jobId, line);
 
   const streamTitle = show.title || `${dj.display_name} Show`;
   const artistName  = dj.display_name || '';
@@ -943,7 +985,7 @@ async function runJobById(jobId) {
 
   await logEvent(jobId, `Using ${credSource === 'dj' ? 'DJ' : 'DEFAULT'} credentials for "${dj.display_name}" on ${mount}`);
 
-  await logEvent(jobId, `Claimed. OrigSlot=${originalSlotSeconds}s | DJ=${dj.display_name} | mount=${mount}`);
+  await logEvent(jobId, `Claimed. OrigSlot=${originalSlotSeconds}s | PlaySlot=${playbackSlotSeconds}s | DJ=${dj.display_name} | mount=${mount}`);
   await logEvent(jobId, `Preparing source: bucket=${BUCKET}, path=${show.storage_path}`);
 
   await preemptExisting(jobId, mount);
@@ -995,7 +1037,7 @@ async function runJobById(jobId) {
       }
       const dur = probeDurationSecondsSync(probeInput);
       if (dur != null) {
-        const slot = originalSlotSeconds;
+        const slot = playbackSlotSeconds;
         if (dur + DURATION_WARN_PAD_SECS < slot) {
           await logEvent(jobId,
             `⚠️ ffprobe: media duration ${formatSecs(dur)} < slot ${formatSecs(slot)} (by ~${formatSecs(slot - dur)}) — will ${EOF_BEHAVIOR === 'loop' ? 'loop' : EOF_BEHAVIOR === 'stop' ? 'end early' : 'attempt resume'} if needed.`,
@@ -1012,7 +1054,7 @@ async function runJobById(jobId) {
     }
   }
 
-  const liveBanner = `🎙️ LIVE (auto-reconnect/resume${ENABLE_LOCAL_COPY ? ', local-copy' : ''}) — "${streamTitle}" by ${artistName || 'DJ'} on ${ICE_HOST}:${ICE_PORT}${mount} (job ${jobId}) @ ${fmtLocal(startUtc.plus({ seconds: 1 }))} until ${fmtLocal(endUtc)}`;
+  const liveBanner = `🎙️ LIVE (auto-reconnect/resume${ENABLE_LOCAL_COPY ? ', local-copy' : ''}, ${FADE_OUT_MS}ms fade, ${appliedGapMs}ms handover gap) — "${streamTitle}" by ${artistName || 'DJ'} on ${ICE_HOST}:${ICE_PORT}${mount} (job ${jobId}) @ ${fmtLocal(startUtc)} until ${fmtLocal(playbackEndUtc)}`;
   console.log(liveBanner);
   await logEvent(jobId, liveBanner);
 
@@ -1021,7 +1063,7 @@ async function runJobById(jobId) {
     iceUser, icePass,
     fallbackUser: DEFAULT_SOURCE_USER, fallbackPass: DEFAULT_SOURCE_PASS,
     mount, streamTitle, artistName,
-    endsAtUtc: endUtc, originalSlotSeconds
+    endsAtUtc: playbackEndUtc, originalSlotSeconds: playbackSlotSeconds
   });
 
   // Cleanup cache
@@ -1106,7 +1148,7 @@ function subscribeRealtime() {
         clearTimers(j.id);
         cancelledJobs.add(j.id);
         const proc = activeProcs.get(j.id);
-        if (proc) { try { proc.kill('SIGTERM'); } catch {} }
+        if (proc) terminateFfmpeg(proc, { jobId: j.id, reason: 'realtime cancellation' });
       }
     }
   });
@@ -1150,6 +1192,7 @@ async function gatherStatus({ eventsLimit = 100, upcomingHours = 24 } = {}) {
       RETRY_TOTAL_MS, RETRY_DELAY_MS, CONNECT_GRACE_MS, RECONNECT_DELAY_MS,
       EOF_BEHAVIOR, ENABLE_LOCAL_COPY, LOCAL_CACHE_DIR, SIGNED_URL_TTL_SECS,
       DOWNLOAD_RETRY_TOTAL_MS, DOWNLOAD_RETRY_DELAY_MS, MAX_LOCAL_FILE_MB, MIN_LOCAL_FILE_BYTES,
+      HANDOVER_GAP_MS, FADE_OUT_MS, FORCE_KILL_AFTER_MS,
       AUTH_401_FAILOVER_THRESHOLD
     },
     timers: { start_timers: startTimers.size, prefetch_timers: prefetchTimers.size, active_procs: activeProcs.size, last_bootstrap_at: lastBootstrapAt ? new Date(lastBootstrapAt).toISOString() : null },
@@ -1359,4 +1402,5 @@ async function main() {
   setInterval(() => { bootstrapUpcoming().catch(()=>{}); }, SAFETY_RESYNC_MS);
 }
 main();
+
 
