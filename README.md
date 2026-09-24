@@ -233,6 +233,7 @@ These can be added under `environment:` in `docker-compose.yml` to fine-tune beh
 | `LOCAL_CACHE_DIR` | `/app/cache` | Cache directory (inside container) |
 | `DOWNLOAD_RETRY_TOTAL_MS` | `600000` | Max time to download a file |
 | `MAX_LOCAL_FILE_MB` | `2048` | Safety cap |
+| `MIN_LOCAL_FILE_BYTES` | `65536` | Reject tiny or invalid cache downloads |
 
 #### Icecast admin kick
 
