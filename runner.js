@@ -807,7 +807,7 @@ async function playShowWithReconnect({
   fallbackUser, fallbackPass,       // default creds (for failover after 401 threshold)
   mount, streamTitle, artistName,
   streamerId, profilePictureUrl,
-  endsAtUtc, originalSlotSeconds
+  endsAtUtc, originalSlotSeconds, sourceDurationSeconds = null
 }) {
   // Absolute seconds played since start of source across all attempts
   let absPlayed = 0;
@@ -818,6 +818,10 @@ async function playShowWithReconnect({
   let currentPass = icePass;
   let usingFallback = false;
   let auth401Count = 0;
+
+  const knownSourceDuration = Number.isFinite(Number(sourceDurationSeconds)) && Number(sourceDurationSeconds) > 0
+    ? Number(sourceDurationSeconds)
+    : null;
 
   const haveFallback = !!(fallbackUser && fallbackPass);
   const isSameAsFallback = (u, p) => u === fallbackUser && p === fallbackPass;
@@ -832,10 +836,27 @@ async function playShowWithReconnect({
 
     const boundedRemaining = Math.min(remainingSec, originalSlotSeconds);
 
+    // A schedule may be longer than its media file. Once we have consumed the
+    // known source duration, the show is finished even if time remains in the
+    // schedule. Without this guard, EOF_BEHAVIOR=resume repeatedly seeks to EOF,
+    // reconnecting to Icecast and interrupting AutoDJ until ends_at.
+    if (
+      EOF_BEHAVIOR !== 'loop' &&
+      knownSourceDuration != null &&
+      absPlayed >= Math.max(0, knownSourceDuration - DURATION_WARN_PAD_SECS)
+    ) {
+      await logEvent(
+        jobId,
+        `Media EOF reached at ~${formatSecs(absPlayed)} of ${formatSecs(knownSourceDuration)} — finishing slot early and releasing Icecast to AutoDJ.`
+      );
+      return { outcome: 'completed' };
+    }
+
     // Decide the input: local file if available, else fresh signed URL
     let inputForFfmpeg;
     const localRec = localFileCache.get(jobId);
-    if (ENABLE_LOCAL_COPY && localRec?.completed && localRec.path) {
+    const usingLocalFile = !!(ENABLE_LOCAL_COPY && localRec?.completed && localRec.path);
+    if (usingLocalFile) {
       inputForFfmpeg = localRec.path;
     } else {
       try {
@@ -965,19 +986,24 @@ async function playShowWithReconnect({
 
     // Handle clean early exit (code 0) BEFORE ends_at
     if (!exitResult.error && exitResult.code === 0) {
-      if (EOF_BEHAVIOR === 'loop') {
-        await logEvent(jobId, `ffmpeg exited cleanly with ~${remAfter}s remaining — looping from start.`);
-        absPlayed = 0;
-        await new Promise(r => setTimeout(r, RECONNECT_DELAY_MS));
-        continue;
-      } else if (EOF_BEHAVIOR === 'stop') {
-        await logEvent(jobId, 'ffmpeg ended normally before ends_at — finishing slot early (EOF_BEHAVIOR=stop).');
+      // ffmpeg code 0 is a normal end of input, not a connection failure.
+      // Only an explicit loop setting should start the source again. Genuine
+      // stream failures exit non-zero and continue through the resume path.
+      if (EOF_BEHAVIOR !== 'loop') {
+        const durationDetail = knownSourceDuration != null
+          ? ` of ${formatSecs(knownSourceDuration)}`
+          : '';
+        await logEvent(
+          jobId,
+          `Media ended normally at ~${formatSecs(absPlayed)}${durationDetail} with ~${remAfter}s left in the scheduled slot — completing show and releasing Icecast to AutoDJ.`
+        );
         return { outcome: 'completed' };
-      } else {
-        await logEvent(jobId, `ffmpeg ended cleanly with ~${remAfter}s remaining — resuming from absPlayed≈${Math.floor(absPlayed)}s (EOF_BEHAVIOR=resume).`);
-        await new Promise(r => setTimeout(r, RECONNECT_DELAY_MS));
-        continue;
       }
+
+      await logEvent(jobId, `ffmpeg exited cleanly with ~${remAfter}s remaining — looping from start (EOF_BEHAVIOR=loop).`);
+      absPlayed = 0;
+      await new Promise(r => setTimeout(r, RECONNECT_DELAY_MS));
+      continue;
     }
 
     // Otherwise unexpected error or signal: attempt resume
@@ -1103,7 +1129,9 @@ async function runJobById(jobId) {
     }
   }
 
-  // ffprobe duration check / warn
+  // ffprobe duration check / warn. The duration is also passed into the
+  // reconnect loop so a shorter show cannot be repeatedly restarted at EOF.
+  let sourceDurationSeconds = null;
   if (ENABLE_FFPROBE_DURATION_CHECK) {
     try {
       let probeInput = null;
@@ -1115,10 +1143,11 @@ async function runJobById(jobId) {
       }
       const dur = probeDurationSecondsSync(probeInput);
       if (dur != null) {
+        sourceDurationSeconds = dur;
         const slot = playbackSlotSeconds;
         if (dur + DURATION_WARN_PAD_SECS < slot) {
           await logEvent(jobId,
-            `⚠️ ffprobe: media duration ${formatSecs(dur)} < slot ${formatSecs(slot)} (by ~${formatSecs(slot - dur)}) — will ${EOF_BEHAVIOR === 'loop' ? 'loop' : EOF_BEHAVIOR === 'stop' ? 'end early' : 'attempt resume'} if needed.`,
+            `⚠️ ffprobe: media duration ${formatSecs(dur)} < slot ${formatSecs(slot)} (by ~${formatSecs(slot - dur)}) — media EOF will complete the show early and release Icecast to AutoDJ.`,
             'error'
           );
         } else {
@@ -1143,7 +1172,8 @@ async function runJobById(jobId) {
     mount, streamTitle, artistName,
     streamerId: dj.azuracast_streamer_id,
     profilePictureUrl: dj.profile_picture_url,
-    endsAtUtc: playbackEndUtc, originalSlotSeconds: playbackSlotSeconds
+    endsAtUtc: playbackEndUtc, originalSlotSeconds: playbackSlotSeconds,
+    sourceDurationSeconds
   });
 
   // Cleanup cache
@@ -1482,6 +1512,3 @@ async function main() {
   setInterval(() => { bootstrapUpcoming().catch(()=>{}); }, SAFETY_RESYNC_MS);
 }
 main();
-
-
-

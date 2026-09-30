@@ -291,7 +291,7 @@ pm2 save
 1. **Bootstrap** — on start, fetches the next 24h of pending jobs and sets timers. Attaches realtime listeners to `jobs` and `schedules` for live cancellations.
 2. **Start window** — when a show's start time arrives, preempts any running job on the same mount (DB cancel + optional Icecast kick).
 3. **Input** — if local copy mode is on, ensures the file is downloaded to disk. Otherwise, creates a fresh signed URL for each attempt.
-4. **ffprobe** — checks duration and warns if the file is shorter than the slot.
+4. **ffprobe** — checks duration and protects against retrying a completed file when it is shorter than the slot.
 5. **Connect** — spawns ffmpeg with ICY metadata. Once alive longer than `CONNECT_GRACE_MS`, fires the Now Playing POST.
 6. **During show** — monitors ffmpeg continuously; on drop, reconnects and resumes from the last known playhead.
 7. **End of slot** — at `ends_at`, SIGTERMs ffmpeg and marks the schedule `completed`.
@@ -325,11 +325,13 @@ Downloads the show file to `/app/cache` before playback, so a Supabase signed UR
 
 On error or disconnection, the runner reconnects and resumes from the last known playhead.
 
-On clean EOF (file ended before `ends_at`), behaviour is controlled by `EOF_BEHAVIOR`:
+On an unexpected error or disconnection, `resume` reconnects from the last known playhead. A clean EOF is treated as a completed show, even when the scheduled slot is longer, so the Icecast mount is released back to AutoDJ.
 
-- `resume` (default) — re-open the file and seek to the last playhead position
-- `loop` — restart from the beginning to fill the slot
-- `stop` — end the slot immediately
+`EOF_BEHAVIOR` controls the exceptions:
+
+- `resume` (default) — resume genuine interruptions, but complete the show on clean EOF
+- `loop` — intentionally restart from the beginning to fill the slot
+- `stop` — do not resume after a clean early exit
 
 ---
 
@@ -406,7 +408,7 @@ Valid `schedules.status` values: `scheduled`, `pending`, `live`, `completed`, `c
 Check logs: `docker compose logs station1`. Usually a missing required env var (`SUPABASE_URL`, `ICE_HOST`, etc.).
 
 **`ffmpeg ended normally before ends_at`**  
-The file is shorter than the slot. Check `last_ffmpeg_errors` in `/status`. Set `EOF_BEHAVIOR=loop` to fill the slot regardless.
+The file is shorter than the slot. The runner now marks the show completed and releases Icecast to AutoDJ. Set `EOF_BEHAVIOR=loop` only when you intentionally want the show repeated to fill the slot.
 
 **`HTTP 400 Bad Request` opening input**  
 Likely an expired signed URL. Local copy mode (on by default) avoids this — confirm `ENABLE_LOCAL_COPY=true`.
