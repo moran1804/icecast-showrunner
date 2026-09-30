@@ -295,6 +295,7 @@ pm2 save
 5. **Connect** — spawns ffmpeg with ICY metadata. Once alive longer than `CONNECT_GRACE_MS`, fires the Now Playing POST.
 6. **During show** — monitors ffmpeg continuously; on drop, reconnects and resumes from the last known playhead.
 7. **End of slot** — at `ends_at`, SIGTERMs ffmpeg and marks the schedule `completed`.
+8. **Restart recovery** — if the runner restarts during a show, it reclaims the orphaned job and seeks to the position dictated by the schedule clock before reconnecting.
 
 ---
 
@@ -302,6 +303,7 @@ pm2 save
 
 - TZ-aware scheduling (Luxon)
 - Reconnect + resume using ffmpeg `-progress out_time` tracking
+- Startup recovery for interrupted shows, aligned to the scheduled play position
 - Local cache mode (download → play local → cleanup)
 - ffprobe duration preflight
 - Preemption with optional Icecast admin kick
@@ -324,6 +326,8 @@ Downloads the show file to `/app/cache` before playback, so a Supabase signed UR
 ## Reconnect & EOF behavior
 
 On error or disconnection, the runner reconnects and resumes from the last known playhead.
+
+If the container restarts during a scheduled show, the new runner detects the orphaned `starting` or `running` job. It clears the stale PID, reclaims the job and seeks to the current scheduled position. For example, a 12:00 show recovered at 12:33 resumes at approximately 33 minutes and still ends at its original scheduled time. Jobs whose end time has already passed are closed without starting ffmpeg.
 
 On an unexpected error or disconnection, `resume` reconnects from the last known playhead. A clean EOF is treated as a completed show, even when the scheduled slot is longer, so the Icecast mount is released back to AutoDJ.
 

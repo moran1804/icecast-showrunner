@@ -208,6 +208,13 @@ async function setJobStatus(jobId, status, pid) {
   const { error } = await supabase.from('jobs').update(patch).eq('id', jobId);
   if (error) throw error;
 }
+async function resetJobForRecovery(jobId) {
+  const { error } = await supabase
+    .from('jobs')
+    .update({ status: 'pending', pid: null })
+    .eq('id', jobId);
+  if (error) throw error;
+}
 async function setScheduleStatus(schedId, status) {
   const { error } = await supabase.from('schedules').update({ status }).eq('id', schedId);
   if (error) throw error;
@@ -650,7 +657,10 @@ function schedulePrefetch(jobId, runAtIso, storagePath) {
   }, delay);
   prefetchTimers.set(jobId, pt);
 }
-function scheduleJob(job, storagePathForPrefetch) {
+function scheduleJob(job, storagePathForPrefetch, {
+  resumeFromScheduleTime = false,
+  skipPrefetch = false
+} = {}) {
   clearTimers(job.id);
   const intendedDelay = delayFromNowMs(job.run_at);
   const delay = Math.max(0, intendedDelay);
@@ -660,8 +670,11 @@ function scheduleJob(job, storagePathForPrefetch) {
     console.log(`📅 Scheduling job ${job.id}: ${fmtLocal(runAtUtc)}  =  ${fmtUtc(runAtUtc)}`);
   }
 
-  if (PREFETCH_MS) schedulePrefetch(job.id, job.run_at, storagePathForPrefetch);
-  const t = setTimeout(() => runJobById(job.id).catch(e => console.error('start timer error:', e?.message || e)), delay);
+  if (PREFETCH_MS && !skipPrefetch) schedulePrefetch(job.id, job.run_at, storagePathForPrefetch);
+  const t = setTimeout(
+    () => runJobById(job.id, { resumeFromScheduleTime }).catch(e => console.error('start timer error:', e?.message || e)),
+    delay
+  );
   startTimers.set(job.id, t);
   console.log(`⏱️ will start in ${Math.round(delay/1000)}s`);
 }
@@ -807,10 +820,13 @@ async function playShowWithReconnect({
   fallbackUser, fallbackPass,       // default creds (for failover after 401 threshold)
   mount, streamTitle, artistName,
   streamerId, profilePictureUrl,
-  endsAtUtc, originalSlotSeconds, sourceDurationSeconds = null
+  endsAtUtc, originalSlotSeconds, sourceDurationSeconds = null,
+  initialSeekSeconds = 0
 }) {
   // Absolute seconds played since start of source across all attempts
-  let absPlayed = 0;
+  let absPlayed = Number.isFinite(Number(initialSeekSeconds))
+    ? Math.max(0, Number(initialSeekSeconds))
+    : 0;
   let attempt = 0;
 
   // Current/active credentials (start with whatever caller chose)
@@ -1014,7 +1030,7 @@ async function playShowWithReconnect({
 }
 
 // ===== Core job execution =====
-async function runJobById(jobId) {
+async function runJobById(jobId, { resumeFromScheduleTime = false } = {}) {
   const job = await getJobById(jobId);
   if (!job || job.status !== 'pending') return;
 
@@ -1054,6 +1070,13 @@ async function runJobById(jobId) {
   const playbackSlotSeconds = Math.max(1, Math.floor(
     (playbackEndUtc.toMillis() - startUtc.toMillis()) / 1000
   ));
+
+  if (DateTime.utc().toMillis() >= playbackEndUtc.toMillis()) {
+    await setJobStatus(jobId, 'ended');
+    await setScheduleStatus(sched.id, 'completed');
+    await logEvent(jobId, 'Scheduled playback window already ended — closing stale job without starting ffmpeg.');
+    return;
+  }
 
   const line = `⏰ Slot window: ${fmtLocal(startUtc)} → ${fmtLocal(endUtc)} | playback stops at ${fmtLocal(playbackEndUtc)} | fade=${FADE_OUT_MS}ms gap=${appliedGapMs}ms`;
   console.log(line);
@@ -1165,6 +1188,22 @@ async function runJobById(jobId) {
   console.log(liveBanner);
   await logEvent(jobId, liveBanner);
 
+  // On startup recovery, align playback with the schedule clock after all
+  // download/probe preparation has completed. For example, a 12:00 show
+  // recovered at 12:33 resumes around 33 minutes into the source.
+  const initialSeekSeconds = resumeFromScheduleTime
+    ? Math.min(
+        playbackSlotSeconds,
+        Math.max(0, (DateTime.utc().toMillis() - startUtc.toMillis()) / 1000)
+      )
+    : 0;
+  if (resumeFromScheduleTime) {
+    await logEvent(
+      jobId,
+      `♻️ Startup recovery: resuming at scheduled position ~${formatSecs(initialSeekSeconds)} and continuing until ${fmtLocal(playbackEndUtc)}.`
+    );
+  }
+
   const outcome = await playShowWithReconnect({
     jobId, schedId: sched.id, storagePath: show.storage_path,
     iceUser, icePass,
@@ -1173,7 +1212,8 @@ async function runJobById(jobId) {
     streamerId: dj.azuracast_streamer_id,
     profilePictureUrl: dj.profile_picture_url,
     endsAtUtc: playbackEndUtc, originalSlotSeconds: playbackSlotSeconds,
-    sourceDurationSeconds
+    sourceDurationSeconds,
+    initialSeekSeconds
   });
 
   // Cleanup cache
@@ -1200,7 +1240,69 @@ async function runJobById(jobId) {
 }
 
 // ===== Bootstrap & Realtime =====
-async function bootstrapUpcoming() {
+async function recoverCurrentShows() {
+  const now = DateTime.utc();
+  const recoveredJobIds = new Set();
+
+  const { data, error } = await supabase
+    .from('jobs')
+    .select(`
+      id, run_at, status, schedule_id, pid,
+      schedule:schedules ( id, starts_at, ends_at, status, show:shows ( storage_path ) )
+    `)
+    .in('status', ['pending', 'starting', 'running'])
+    .gte('run_at', now.minus({ days: 1 }).toISO())
+    .lte('run_at', now.toISO())
+    .order('run_at', { ascending: true })
+    .limit(1000);
+
+  if (error) {
+    console.error('recoverCurrentShows error:', error.message);
+    return recoveredJobIds;
+  }
+
+  for (const job of data || []) {
+    const sched = job.schedule;
+    const startsAt = parseDbTime(sched?.starts_at);
+    const endsAt = parseDbTime(sched?.ends_at);
+    if (!sched || !startsAt || !endsAt) continue;
+
+    if (sched.status === 'cancelled') {
+      if (job.status !== 'pending') await setJobStatus(job.id, 'cancelled');
+      continue;
+    }
+
+    if (endsAt.toMillis() <= now.toMillis()) {
+      await setJobStatus(job.id, 'ended');
+      await setScheduleStatus(sched.id, 'completed');
+      await logEvent(job.id, 'Startup cleanup: stale job was past its scheduled end and has been closed.');
+      continue;
+    }
+
+    if (startsAt.toMillis() > now.toMillis()) continue;
+
+    if (job.status === 'starting' || job.status === 'running') {
+      await resetJobForRecovery(job.id);
+      await setScheduleStatus(sched.id, 'scheduled');
+    }
+
+    const elapsedSeconds = Math.max(0, (now.toMillis() - startsAt.toMillis()) / 1000);
+    await logEvent(
+      job.id,
+      `Startup found an active scheduled show with no local process — reclaiming it at ~${formatSecs(elapsedSeconds)}.`
+    );
+    const storagePath = sched?.show?.storage_path || null;
+    scheduleJob(job, storagePath, {
+      resumeFromScheduleTime: true,
+      skipPrefetch: true
+    });
+    recoveredJobIds.add(job.id);
+  }
+
+  return recoveredJobIds;
+}
+
+async function bootstrapUpcoming(excludeJobIds = new Set()) {
   const nowMinus = DateTime.utc().minus({ seconds: 15 }).toISO();
   const untilIso = DateTime.utc().plus({ days: 1 }).toISO();
 
@@ -1218,6 +1320,7 @@ async function bootstrapUpcoming() {
 
   if (error) { console.error('bootstrapUpcoming error:', error.message); return; }
   (data||[]).forEach(j => {
+    if (excludeJobIds.has(j.id)) return;
     const storagePath = j?.schedule?.show?.storage_path || null;
     scheduleJob(j, storagePath);
   });
@@ -1505,7 +1608,8 @@ async function main() {
     console.log(`Docs:   http://localhost:${HEALTH_PORT}/docs\n`);
   }
 
-  await bootstrapUpcoming();
+  const recoveredJobIds = await recoverCurrentShows();
+  await bootstrapUpcoming(recoveredJobIds);
   subscribeRealtime();
   startHealthServer();
 
