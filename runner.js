@@ -32,6 +32,11 @@ const PREFETCH_MS        = Number(process.env.PREFETCH_MS || 0);
 const PREEMPT_WAIT_MS    = Number(process.env.PREEMPT_WAIT_MS || 5000);
 const PREEMPT_POLL_MS    = Number(process.env.PREEMPT_POLL_MS || 500);
 
+// Keep timers inside the same window used by bootstrapUpcoming. This is safely
+// below Node's signed 32-bit setTimeout limit, which otherwise clamps an
+// oversized future timer to 1ms and can start a show immediately.
+const TIMER_ARM_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 // Initial connect retries
 const RETRY_TOTAL_MS     = Number(process.env.RETRY_TOTAL_MS || 180_000);
 const RETRY_DELAY_MS     = Number(process.env.RETRY_DELAY_MS || 5_000);
@@ -670,6 +675,18 @@ function scheduleJob(job, storagePathForPrefetch, {
     console.log(`📅 Scheduling job ${job.id}: ${fmtLocal(runAtUtc)}  =  ${fmtUtc(runAtUtc)}`);
   }
 
+  if (!Number.isFinite(delay)) {
+    console.error(`Invalid run_at for job ${job.id}; leaving it pending for a later database resync.`);
+    return;
+  }
+
+  if (delay > TIMER_ARM_WINDOW_MS) {
+    console.log(
+      `🗓️ Deferring far-future job ${job.id}; starts in ${Math.round(delay / 86_400_000)} days and will be armed inside the 24-hour scheduling window.`
+    );
+    return;
+  }
+
   if (PREFETCH_MS && !skipPrefetch) schedulePrefetch(job.id, job.run_at, storagePathForPrefetch);
   const t = setTimeout(
     () => runJobById(job.id, { resumeFromScheduleTime }).catch(e => console.error('start timer error:', e?.message || e)),
@@ -1116,39 +1133,55 @@ async function runJobById(jobId, { resumeFromScheduleTime = false } = {}) {
   await logEvent(jobId, `Claimed. OrigSlot=${originalSlotSeconds}s | PlaySlot=${playbackSlotSeconds}s | DJ=${dj.display_name} | mount=${mount}`);
   await logEvent(jobId, `Preparing source: bucket=${BUCKET}, path=${show.storage_path}`);
 
-  await preemptExisting(jobId, mount);
-  await logEvent(jobId, `Mount may be busy (e.g., live DJ). Will retry connection for up to ${Math.floor(RETRY_TOTAL_MS/1000)}s if needed.`, 'info');
+  const storagePath = typeof show.storage_path === 'string' ? show.storage_path.trim() : '';
+  if (!storagePath) {
+    await logEvent(jobId, 'Show has no storage_path — refusing to interrupt the current programme.', 'error');
+    await setJobStatus(jobId, 'failed');
+    try { await setScheduleStatus(sched.id, 'failed'); } catch {}
+    return;
+  }
+
+  const verifyRemoteSource = async () => {
+    const url = signedUrlCache.get(jobId) || await createSignedDownloadUrl(storagePath);
+    const headRes = await head(url);
+    if (!headRes.ok) {
+      throw new Error(`HEAD status=${headRes.status} err=${headRes.err || ''}`);
+    }
+    signedUrlCache.set(jobId, url);
+    await logEvent(jobId, `Source OK (status ${headRes.status}, type ${headRes.contentType || 'unknown'})`);
+  };
 
   // If not using local copy, do a quick early HEAD to fail fast
   if (!ENABLE_LOCAL_COPY) {
-    let firstUrl;
-    try { firstUrl = signedUrlCache.get(jobId) || await createSignedDownloadUrl(show.storage_path); }
+    try { await verifyRemoteSource(); }
     catch (e) {
-      await logEvent(jobId, `Signed URL error: ${e.message}`, 'error');
+      await logEvent(jobId, `Source validation failed: ${e.message} — current programme will continue.`, 'error');
       await setJobStatus(jobId, 'failed');
       try { await setScheduleStatus(sched.id, 'failed'); } catch {}
       return;
     }
-    const headRes = await head(firstUrl);
-    if (!headRes.ok) {
-      await logEvent(jobId, `HEAD failed: status=${headRes.status} err=${headRes.err||''}`, 'error');
-      await setJobStatus(jobId, 'failed');
-      try { await setScheduleStatus(sched.id, 'failed'); } catch {}
-      return;
-    }
-    await logEvent(jobId, `Source OK (status ${headRes.status}, type ${headRes.contentType || 'unknown'})`);
   }
 
   // claimJob keeps the job in "starting". It becomes running/live only after
   // ffmpeg survives the connection grace period and has a real PID.
 
-  // If local copy mode and not already prefetched, try to download now (non-fatal)
+  // If local copy mode and not already prefetched, download before touching the
+  // current programme. If local preparation fails, verify that remote streaming
+  // is genuinely available before allowing handover.
   if (ENABLE_LOCAL_COPY && !localFileCache.get(jobId)?.completed) {
     try {
       await ensureCacheDir();
-      await downloadShowToLocal({ jobId, storagePath: show.storage_path });
+      await downloadShowToLocal({ jobId, storagePath });
     } catch (e) {
-      await logEvent(jobId, `Local download at start failed (${e.message}) — will stream remote this attempt`, 'error');
+      await logEvent(jobId, `Local download at start failed (${e.message}) — checking remote fallback`, 'error');
+      try {
+        await verifyRemoteSource();
+      } catch (remoteError) {
+        await logEvent(jobId, `Source preparation failed: ${remoteError.message} — current programme will continue.`, 'error');
+        await setJobStatus(jobId, 'failed');
+        try { await setScheduleStatus(sched.id, 'failed'); } catch {}
+        return;
+      }
     }
   }
 
@@ -1162,7 +1195,7 @@ async function runJobById(jobId, { resumeFromScheduleTime = false } = {}) {
       if (ENABLE_LOCAL_COPY && localRec?.completed && localRec.path) {
         probeInput = localRec.path;
       } else {
-        probeInput = await createSignedDownloadUrl(show.storage_path);
+        probeInput = await createSignedDownloadUrl(storagePath);
       }
       const dur = probeDurationSecondsSync(probeInput);
       if (dur != null) {
@@ -1177,12 +1210,22 @@ async function runJobById(jobId, { resumeFromScheduleTime = false } = {}) {
           await logEvent(jobId, `ffprobe: media duration ${formatSecs(dur)} (slot ${formatSecs(slot)})`);
         }
       } else {
-        await logEvent(jobId, `ffprobe: could not determine duration (non-fatal)`);
+        await logEvent(jobId, 'ffprobe could not determine media duration — refusing handover so the current programme can continue.', 'error');
+        await setJobStatus(jobId, 'failed');
+        try { await setScheduleStatus(sched.id, 'failed'); } catch {}
+        return;
       }
     } catch (e) {
-      await logEvent(jobId, `ffprobe error: ${e.message} (non-fatal)`, 'error');
+      await logEvent(jobId, `ffprobe error: ${e.message} — refusing handover so the current programme can continue.`, 'error');
+      await setJobStatus(jobId, 'failed');
+      try { await setScheduleStatus(sched.id, 'failed'); } catch {}
+      return;
     }
   }
+
+  // Only a due job with valid, prepared audio may take control of the mount.
+  await preemptExisting(jobId, mount);
+  await logEvent(jobId, `Source ready. Taking control of ${mount}; connection retries allowed for up to ${Math.floor(RETRY_TOTAL_MS/1000)}s.`, 'info');
 
   const liveBanner = `🎙️ LIVE (auto-reconnect/resume${ENABLE_LOCAL_COPY ? ', local-copy' : ''}, ${FADE_OUT_MS}ms fade, ${appliedGapMs}ms handover gap) — "${streamTitle}" by ${artistName || 'DJ'} on ${ICE_HOST}:${ICE_PORT}${mount} (job ${jobId}) @ ${fmtLocal(startUtc)} until ${fmtLocal(playbackEndUtc)}`;
   console.log(liveBanner);
@@ -1205,7 +1248,7 @@ async function runJobById(jobId, { resumeFromScheduleTime = false } = {}) {
   }
 
   const outcome = await playShowWithReconnect({
-    jobId, schedId: sched.id, storagePath: show.storage_path,
+    jobId, schedId: sched.id, storagePath,
     iceUser, icePass,
     fallbackUser: DEFAULT_SOURCE_USER, fallbackPass: DEFAULT_SOURCE_PASS,
     mount, streamTitle, artistName,
