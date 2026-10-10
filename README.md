@@ -296,6 +296,8 @@ pm2 save
 6. **During show** — monitors ffmpeg continuously; on drop, reconnects and resumes from the last known playhead.
 7. **End of slot** — at `ends_at`, SIGTERMs ffmpeg and marks the schedule `completed`.
 8. **Restart recovery** — if the runner restarts during a show, it reclaims the orphaned job and seeks to the position dictated by the schedule clock before reconnecting.
+9. **Safe future scheduling** — far-future Realtime jobs stay pending instead of creating an oversized Node.js timer. The regular database scan arms them when they enter the 24-hour window.
+10. **Protected handover** — a due show must have a valid source and pass download/remote and ffprobe checks before it can preempt the current programme.
 
 ---
 
@@ -304,6 +306,8 @@ pm2 save
 - TZ-aware scheduling (Luxon)
 - Reconnect + resume using ffmpeg `-progress out_time` tracking
 - Startup recovery for interrupted shows, aligned to the scheduled play position
+- Safe handling of far-future jobs without oversized JavaScript timers
+- Source validation before the current programme is preempted
 - Local cache mode (download → play local → cleanup)
 - ffprobe duration preflight
 - Preemption with optional Icecast admin kick
