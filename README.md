@@ -222,6 +222,7 @@ These can be added under `environment:` in `docker-compose.yml` to fine-tune beh
 | Key | Default | Purpose |
 |---|---|---|
 | `HEALTH_PORT` | `8080` | `/status` HTTP port |
+| `ICECAST_SOURCE_CHECK_MS` | `15000` | How often to verify active show mounts appear in Icecast status (ms; minimum 5000) |
 | `LOG_DIR` | `/app/logs` | ffmpeg log directory (inside container) |
 | `LAST_ERROR_LIMIT` | `5` | Last N errors exposed in `/status` |
 
@@ -305,6 +306,8 @@ pm2 save
 
 - TZ-aware scheduling (Luxon)
 - Reconnect + resume using ffmpeg `-progress out_time` tracking
+- Icecast source monitoring logs when an active show mount disappears for two checks and when it returns
+- Unexpected FFmpeg exits are logged with exit code, signal, play position, recent FFmpeg errors, and the per-attempt log filename
 - Transcodes every show to stereo 44.1 kHz MP3 at 128 kbps before sending it to Icecast
 - Startup recovery for interrupted shows, aligned to the scheduled play position
 - Safe handling of far-future jobs without oversized JavaScript timers
@@ -382,7 +385,7 @@ Query params:
 - `events` — number of recent events to return (default 100, max 500)
 - `hours` — upcoming show horizon in hours (default 24, max 168)
 
-Response includes: `ok`, `runner`, `config`, `icecast`, `live`, `upcoming`, `recent_events`, `last_ffmpeg_errors`.
+Response includes: `ok`, `runner`, `config`, `icecast`, `icecast_source_monitor`, `live`, `upcoming`, `recent_events`, `last_ffmpeg_errors`.
 
 ---
 
