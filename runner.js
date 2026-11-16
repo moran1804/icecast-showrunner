@@ -45,6 +45,10 @@ const CONNECT_GRACE_MS   = Number(process.env.CONNECT_GRACE_MS || 7_000);
 // Mid-show reconnect loop
 const RECONNECT_DELAY_MS = Number(process.env.RECONNECT_DELAY_MS || 2_000);
 
+// Icecast source health polling while FFmpeg is expected to be streaming
+const ICECAST_SOURCE_CHECK_MS = Math.max(5_000, Number(process.env.ICECAST_SOURCE_CHECK_MS || 15_000));
+const ICECAST_SOURCE_MISSING_CHECKS = 2;
+
 // Status endpoint
 const HEALTH_PORT = Number(process.env.HEALTH_PORT || 0);
 
@@ -577,6 +581,10 @@ const startTimers = new Map();
 const prefetchTimers = new Map();
 const signedUrlCache = new Map();
 const activeProcs = new Map();
+const activeStreamMounts = new Map();
+const icecastSourceStates = new Map();
+let icecastSourceMonitorBusy = false;
+let icecastMonitorUnavailable = false;
 const cancelledJobs = new Set(); // in-memory cancellation flags, avoids per-second DB polling
 
 let lastBootstrapAt = 0;
@@ -597,16 +605,22 @@ function makeLogPath(jobId, attemptTag) {
 function shouldFlagAsError(line) {
   return /error|failed|failure|refused|denied|timed out|not found|unreachable|broken|invalid|disconnect|reset|403|401|404|500|502|503|504/i.test(line);
 }
+function redactFfmpegSecrets(value) {
+  return String(value).replace(/(icecast:\/\/)[^\s"'<>@]+@/gi, '$1[credentials-redacted]@');
+}
 function attachFfmpegLogging(proc, { jobId, attemptTag }) {
   const logPath = makeLogPath(jobId, attemptTag);
   const stream = createWriteStream(logPath, { flags: 'a' });
+  const recentErrors = [];
   const write = (buf) => {
-    const text = buf.toString();
+    const text = redactFfmpegSecrets(buf.toString());
     stream.write(text);
     for (const line of text.split(/\r?\n/)) {
       if (!line) continue;
       if (shouldFlagAsError(line)) {
         const msg = line.trim().slice(0, 500);
+        recentErrors.push(msg);
+        if (recentErrors.length > 8) recentErrors.shift();
         pushLastError({ ts: new Date().toISOString(), job_id: jobId, attempt: attemptTag, message: msg, log: path.basename(logPath) });
         logEvent(jobId, msg, 'error').catch(() => {});
       }
@@ -616,7 +630,7 @@ function attachFfmpegLogging(proc, { jobId, attemptTag }) {
   proc.stdout.on('data', write);
   proc.once('exit', () => stream.end());
   proc.once('error', () => stream.end());
-  return logPath;
+  return { logPath, recentErrors };
 }
 
 function terminateFfmpeg(proc, { jobId = null, reason = 'stop requested' } = {}) {
@@ -788,7 +802,7 @@ async function startFfmpegWithRetries({ jobId, schedId, args, streamTitle, artis
     await logEvent(jobId, `Attempt ${attempt}: starting ffmpeg (remaining ~${Math.ceil(remaining/1000)}s)…`);
     const proc = spawn(FFMPEG, args, { stdio: ['ignore','pipe','pipe'] });
 
-    attachFfmpegLogging(proc, { jobId, attemptTag: `start-${attempt}` });
+    const ffmpegDiagnostics = attachFfmpegLogging(proc, { jobId, attemptTag: `start-${attempt}` });
 
     // Watch early stderr for auth failures
     let saw401 = false;
@@ -810,8 +824,8 @@ async function startFfmpegWithRetries({ jobId, schedId, args, streamTitle, artis
     try { proc.stderr.off('data', authListener); } catch {}
 
     if (result.ok) {
-      await logEvent(jobId, `Connected to Icecast (ffmpeg running).`);
-      return { proc };
+      await logEvent(jobId, `Connected to Icecast mount ${mount} (pid=${proc.pid}, attempt=${attempt}).`);
+      return { proc, diagnostics: ffmpegDiagnostics };
     }
 
     // Early exit: check if this was an auth failure
@@ -821,8 +835,10 @@ async function startFfmpegWithRetries({ jobId, schedId, args, streamTitle, artis
       throw err;
     }
 
+    const errorDetail = ffmpegDiagnostics.recentErrors.slice(-3).join(' | ');
     lastErrMsg = result.error?.message || `code=${result.code} signal=${result.signal ?? 'none'}`;
-    await logEvent(jobId, `Connection failed early: ${lastErrMsg}`, 'error');
+    if (errorDetail) lastErrMsg += `; FFmpeg: ${errorDetail}`;
+    await logEvent(jobId, `Connection to Icecast mount ${mount} failed before grace period: ${lastErrMsg}; ffmpeg_log=${path.basename(ffmpegDiagnostics.logPath)}`, 'error');
 
     const stillTime = deadline - Date.now();
     if (stillTime <= 0) throw new Error(`Unable to connect within retry window. Last error: ${lastErrMsg}`);
@@ -920,9 +936,11 @@ async function playShowWithReconnect({
     });
 
     let proc;
+    let ffmpegDiagnostics = null;
     try {
       const started = await startFfmpegWithRetries({ jobId, schedId, args, streamTitle, artistName, mount });
       proc = started.proc;
+      ffmpegDiagnostics = started.diagnostics;
       auth401Count = 0; // reset on success
     } catch (e) {
       const msg = String(e?.message || '');
@@ -969,6 +987,8 @@ async function playShowWithReconnect({
     let outTimeThisAttempt = 0;
 
     activeProcs.set(jobId, proc);
+    activeStreamMounts.set(jobId, { mount, pid: proc.pid, attempt, log: path.basename(ffmpegDiagnostics?.logPath || '') });
+    icecastSourceStates.set(jobId, { missingChecks: 0, missingLogged: false, monitorUnavailableLogged: false, lastCheckAt: null, present: null });
     await setJobStatus(jobId, 'running', proc.pid);
     await setScheduleStatus(schedId, 'live');
     await logEvent(jobId, `ffmpeg pid=${proc.pid} (attempt ${attempt}, seek=${seekSeconds}s)`);
@@ -981,18 +1001,6 @@ async function playShowWithReconnect({
 
     startCancelWatcher(jobId, proc, schedId, streamTitle, artistName || 'DJ');
 
-    let lastLog = 0;
-    proc.stderr.on('data', async (buf) => {
-      const n = Date.now();
-      if (n - lastLog >= 1200) {
-        lastLog = n;
-        const s = buf.toString();
-        // Only write to DB for errors; routine ffmpeg progress goes to the disk log only
-        if (shouldFlagAsError(s)) {
-          await logEvent(jobId, s.length > 400 ? s.slice(0, 400) + '…' : s, 'error');
-        }
-      }
-    });
     proc.stdout.on('data', async (buf) => {
       const lines = buf.toString().split(/\r?\n/);
       for (const line of lines) {
@@ -1008,6 +1016,8 @@ async function playShowWithReconnect({
 
     clearTimeout(watchdog);
     activeProcs.delete(jobId);
+    activeStreamMounts.delete(jobId);
+    icecastSourceStates.delete(jobId);
 
     // Accumulate absolute progress (add per-attempt processed duration)
     absPlayed += Math.max(0, outTimeThisAttempt || 0);
@@ -1041,7 +1051,12 @@ async function playShowWithReconnect({
 
     // Otherwise unexpected error or signal: attempt resume
     const reason = exitResult?.error?.message || `code=${exitResult.code} signal=${exitResult.signal ?? 'none'}`;
-    await logEvent(jobId, `ffmpeg ended unexpectedly: ${reason} — will attempt resume in ${RECONNECT_DELAY_MS}ms`, 'error');
+    const errorDetail = ffmpegDiagnostics?.recentErrors.slice(-3).join(' | ') || 'no FFmpeg error line captured';
+    await logEvent(
+      jobId,
+      `ICECAST_DISCONNECT: FFmpeg stopped unexpectedly while the slot still had ${remAfter}s remaining; mount=${mount}; pid=${proc.pid}; attempt=${attempt}; exit=${reason}; played≈${formatSecs(absPlayed)}; ffmpeg=${errorDetail}; ffmpeg_log=${path.basename(ffmpegDiagnostics?.logPath || '')}; reconnect_in=${RECONNECT_DELAY_MS}ms`,
+      'error'
+    );
     await new Promise(r => setTimeout(r, RECONNECT_DELAY_MS));
   }
 }
@@ -1446,6 +1461,7 @@ async function gatherStatus({ eventsLimit = 100, upcomingHours = 24 } = {}) {
     config: {
       SAFETY_RESYNC_MS, PREFETCH_MS, PREEMPT_WAIT_MS, PREEMPT_POLL_MS,
       RETRY_TOTAL_MS, RETRY_DELAY_MS, CONNECT_GRACE_MS, RECONNECT_DELAY_MS,
+      ICECAST_SOURCE_CHECK_MS,
       EOF_BEHAVIOR, ENABLE_LOCAL_COPY, LOCAL_CACHE_DIR, SIGNED_URL_TTL_SECS,
       DOWNLOAD_RETRY_TOTAL_MS, DOWNLOAD_RETRY_DELAY_MS, MAX_LOCAL_FILE_MB, MIN_LOCAL_FILE_BYTES,
       HANDOVER_GAP_MS, FADE_OUT_MS, FORCE_KILL_AFTER_MS,
@@ -1454,6 +1470,14 @@ async function gatherStatus({ eventsLimit = 100, upcomingHours = 24 } = {}) {
     timers: { start_timers: startTimers.size, prefetch_timers: prefetchTimers.size, active_procs: activeProcs.size, last_bootstrap_at: lastBootstrapAt ? new Date(lastBootstrapAt).toISOString() : null },
     realtime: rtStates,
     icecast: { host: ICE_HOST, port: ICE_PORT, admin_host: ICE_ADMIN_HOST, admin_port: ICE_ADMIN_PORT, reachable: !!ice.ok, status: ice.ok ? ice.status : { error: ice.error || `HTTP ${ice.status}` } },
+    icecast_source_monitor: [...activeStreamMounts].map(([jobId, stream]) => ({
+      job_id: jobId,
+      mount: stream.mount,
+      pid: stream.pid,
+      present: icecastSourceStates.get(jobId)?.present ?? null,
+      missing_checks: icecastSourceStates.get(jobId)?.missingChecks ?? 0,
+      last_check_at: icecastSourceStates.get(jobId)?.lastCheckAt ?? null
+    })),
     active_processes: active,
     live: Array.isArray(live) ? live : { error: live.error },
     upcoming: Array.isArray(upcoming) ? upcoming : { error: upcoming.error },
@@ -1541,6 +1565,84 @@ async function fetchIcecastStatus() {
     return { ok: true, status: json.icestats || json };
   } catch (e) {
     return { ok: false, error: e.message };
+  }
+}
+function canonicalIcecastMount(value) {
+  if (!value) return null;
+  const mount = String(value).split('?')[0].trim();
+  if (!mount) return null;
+  return (mount.startsWith('/') ? mount : `/${mount}`).replace(/\/$/, '') || '/';
+}
+function getIcecastSourceMounts(status) {
+  const raw = status?.source;
+  const sources = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return new Set(sources.map((source) => {
+    if (source?.mount) return canonicalIcecastMount(source.mount);
+    try {
+      if (source?.listenurl) return canonicalIcecastMount(new URL(source.listenurl).pathname);
+    } catch {}
+    return null;
+  }).filter(Boolean));
+}
+async function monitorIcecastSources() {
+  if (icecastSourceMonitorBusy || activeStreamMounts.size === 0) return;
+  icecastSourceMonitorBusy = true;
+  try {
+    const check = await fetchIcecastStatus();
+    const checkedAt = new Date().toISOString();
+    if (!check.ok) {
+      for (const [jobId] of activeStreamMounts) {
+        const state = icecastSourceStates.get(jobId);
+        if (!state || state.monitorUnavailableLogged) continue;
+        state.monitorUnavailableLogged = true;
+        state.lastCheckAt = checkedAt;
+        await logEvent(jobId, `ICECAST_MONITOR_UNAVAILABLE: Could not read Icecast source status (HTTP ${check.status || 'unavailable'}${check.error ? `, ${check.error}` : ''}); mount checks will resume when the status endpoint is reachable.`, 'error');
+      }
+      icecastMonitorUnavailable = true;
+      return;
+    }
+
+    const mounts = getIcecastSourceMounts(check.status);
+    if (icecastMonitorUnavailable) {
+      for (const [jobId] of activeStreamMounts) {
+        await logEvent(jobId, 'ICECAST_MONITOR_RESTORED: Icecast status endpoint is reachable again; source checks resumed.');
+        const state = icecastSourceStates.get(jobId);
+        if (state) state.monitorUnavailableLogged = false;
+      }
+      icecastMonitorUnavailable = false;
+    }
+
+    for (const [jobId, stream] of activeStreamMounts) {
+      const state = icecastSourceStates.get(jobId);
+      if (!state) continue;
+      state.lastCheckAt = checkedAt;
+      state.monitorUnavailableLogged = false;
+      const mount = canonicalIcecastMount(stream.mount);
+      if (mounts.has(mount)) {
+        state.present = true;
+        state.missingChecks = 0;
+        if (state.missingLogged) {
+          state.missingLogged = false;
+          await logEvent(jobId, `ICECAST_SOURCE_RESTORED: Mount ${mount} is visible in Icecast status again (pid=${stream.pid}, attempt=${stream.attempt}).`);
+        }
+        continue;
+      }
+
+      state.present = false;
+      state.missingChecks += 1;
+      if (!state.missingLogged && state.missingChecks >= ICECAST_SOURCE_MISSING_CHECKS) {
+        state.missingLogged = true;
+        await logEvent(
+          jobId,
+          `ICECAST_SOURCE_MISSING: Mount ${mount} was absent from ${state.missingChecks} consecutive Icecast status checks while FFmpeg was running (pid=${stream.pid}, attempt=${stream.attempt}, ffmpeg_log=${stream.log || 'unknown'}). The runner will log when the mount returns; FFmpeg process state is monitored separately.`,
+          'error'
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Icecast source monitor failed:', error?.message || error);
+  } finally {
+    icecastSourceMonitorBusy = false;
   }
 }
 function mapSafeDj(dj) { return dj ? { id: dj.id, display_name: dj.display_name, icecast_mountpoint: dj.icecast_mountpoint || '/live' } : null; }
@@ -1655,6 +1757,8 @@ async function main() {
   await bootstrapUpcoming(recoveredJobIds);
   subscribeRealtime();
   startHealthServer();
+  const icecastMonitor = setInterval(() => { monitorIcecastSources().catch(() => {}); }, ICECAST_SOURCE_CHECK_MS);
+  icecastMonitor.unref();
 
   setInterval(() => { bootstrapUpcoming().catch(()=>{}); }, SAFETY_RESYNC_MS);
 }
