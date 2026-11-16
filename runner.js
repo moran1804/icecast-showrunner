@@ -558,7 +558,7 @@ function buildFfmpegArgs({
     ...inputOpts,
     '-i', fileUrl,
     ...audioFilters,
-    '-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+    '-c:a', 'libmp3lame', '-b:a', '128k', '-ar', '44100', '-ac', '2',
     '-metadata', `title=${showName}`,
     ...(djName ? ['-metadata', `artist=${djName}`] : []),
     '-metadata', `streamtitle=${icyTitle}`,
