@@ -305,6 +305,7 @@ pm2 save
 
 - TZ-aware scheduling (Luxon)
 - Reconnect + resume using ffmpeg `-progress out_time` tracking
+- Transcodes every show to stereo 44.1 kHz MP3 at 128 kbps before sending it to Icecast
 - Startup recovery for interrupted shows, aligned to the scheduled play position
 - Safe handling of far-future jobs without oversized JavaScript timers
 - Source validation before the current programme is preempted
