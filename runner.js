@@ -69,6 +69,7 @@ const MIN_LOCAL_FILE_BYTES = Number(process.env.MIN_LOCAL_FILE_BYTES || 65_536);
 // Controlled handover between scheduled shows
 const HANDOVER_GAP_MS = Number(process.env.HANDOVER_GAP_MS || 0);
 const FADE_OUT_MS = Number(process.env.FADE_OUT_MS || 5_000);
+const FADE_IN_MS = Number(process.env.FADE_IN_MS || 2_000);
 const FORCE_KILL_AFTER_MS = Number(process.env.FORCE_KILL_AFTER_MS || 1_000);
 
 // ffprobe duration check
@@ -526,7 +527,8 @@ function buildFfmpegArgs({
   fileUrl,
   iceUser, icePass, mount,
   streamTitle, artistName,
-  seekSeconds = 0
+  seekSeconds = 0,
+  fadeIn = false
 }) {
   const outUrl = `icecast://${encodeURIComponent(iceUser)}:${encodeURIComponent(icePass)}@${ICE_HOST}:${ICE_PORT}${mount}`;
   const showName = String(streamTitle || 'Scheduled Show').replace(/\s+/g, ' ').trim();
@@ -544,11 +546,13 @@ function buildFfmpegArgs({
     );
   }
 
-  const fadeSeconds = Math.max(0, Math.min(Number(slotSeconds), FADE_OUT_MS / 1000));
-  const fadeStartSeconds = Math.max(0, Number(slotSeconds) - fadeSeconds);
-  const audioFilters = fadeSeconds > 0
-    ? ['-af', `afade=t=out:st=${fadeStartSeconds.toFixed(3)}:d=${fadeSeconds.toFixed(3)}`]
-    : [];
+  const fadeOutSeconds = Math.max(0, Math.min(Number(slotSeconds), FADE_OUT_MS / 1000));
+  const fadeOutStartSeconds = Math.max(0, Number(slotSeconds) - fadeOutSeconds);
+  const fadeInSeconds = fadeIn ? Math.max(0, Math.min(Number(slotSeconds), FADE_IN_MS / 1000)) : 0;
+  const audioFadeFilters = [];
+  if (fadeInSeconds > 0) audioFadeFilters.push(`afade=t=in:st=0:d=${fadeInSeconds.toFixed(3)}`);
+  if (fadeOutSeconds > 0) audioFadeFilters.push(`afade=t=out:st=${fadeOutStartSeconds.toFixed(3)}:d=${fadeOutSeconds.toFixed(3)}`);
+  const audioFilters = audioFadeFilters.length ? ['-af', audioFadeFilters.join(',')] : [];
 
   return [
     '-hide_banner', '-nostats', '-loglevel', 'info',
@@ -916,7 +920,8 @@ async function playShowWithReconnect({
       fileUrl: inputForFfmpeg,
       iceUser: currentUser, icePass: currentPass,
       mount, streamTitle, artistName,
-      seekSeconds
+      seekSeconds,
+      fadeIn: attempt === 1
     });
 
     let proc;
@@ -1448,7 +1453,7 @@ async function gatherStatus({ eventsLimit = 100, upcomingHours = 24 } = {}) {
       RETRY_TOTAL_MS, RETRY_DELAY_MS, CONNECT_GRACE_MS, RECONNECT_DELAY_MS,
       EOF_BEHAVIOR, ENABLE_LOCAL_COPY, LOCAL_CACHE_DIR, SIGNED_URL_TTL_SECS,
       DOWNLOAD_RETRY_TOTAL_MS, DOWNLOAD_RETRY_DELAY_MS, MAX_LOCAL_FILE_MB, MIN_LOCAL_FILE_BYTES,
-      HANDOVER_GAP_MS, FADE_OUT_MS, FORCE_KILL_AFTER_MS,
+      HANDOVER_GAP_MS, FADE_IN_MS, FADE_OUT_MS, FORCE_KILL_AFTER_MS,
       AUTH_401_FAILOVER_THRESHOLD
     },
     timers: { start_timers: startTimers.size, prefetch_timers: prefetchTimers.size, active_procs: activeProcs.size, last_bootstrap_at: lastBootstrapAt ? new Date(lastBootstrapAt).toISOString() : null },
