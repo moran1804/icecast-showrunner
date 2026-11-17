@@ -921,7 +921,7 @@ async function playShowWithReconnect({
       iceUser: currentUser, icePass: currentPass,
       mount, streamTitle, artistName,
       seekSeconds,
-      fadeIn: attempt === 1
+      fadeIn: attempt === 1 // Avoid restarting the fade after a reconnect.
     });
 
     let proc;
