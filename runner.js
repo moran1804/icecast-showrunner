@@ -67,8 +67,8 @@ const MAX_LOCAL_FILE_MB = Number(process.env.MAX_LOCAL_FILE_MB || 2048);
 const MIN_LOCAL_FILE_BYTES = Number(process.env.MIN_LOCAL_FILE_BYTES || 65_536);
 
 // Controlled handover between scheduled shows
-const HANDOVER_GAP_MS = Number(process.env.HANDOVER_GAP_MS || 2_000);
-const FADE_OUT_MS = Number(process.env.FADE_OUT_MS || 2_000);
+const HANDOVER_GAP_MS = Number(process.env.HANDOVER_GAP_MS || 0);
+const FADE_OUT_MS = Number(process.env.FADE_OUT_MS || 5_000);
 const FORCE_KILL_AFTER_MS = Number(process.env.FORCE_KILL_AFTER_MS || 1_000);
 
 // ffprobe duration check
